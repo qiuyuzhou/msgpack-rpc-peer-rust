@@ -15,10 +15,36 @@ impl<T: Serialize> Serialize for Arguments<T> {
 struct ListSerializer<S>(S);
 
 /// Enforce the same outer list contract when decoding handler arguments.
-pub(crate) struct ListDeserializer(pub crate::Value);
+struct ListDeserializer<D>(D);
 
-impl<'de> serde::Deserializer<'de> for ListDeserializer {
-    type Error = rmpv::ext::Error;
+pub(crate) fn decode<A: serde::de::DeserializeOwned>(
+    params: crate::Value,
+    limit: usize,
+) -> Result<A, crate::Error> {
+    let bytes = crate::wire::encode(&params, limit).map_err(|_| crate::Error::InvalidParams)?;
+    let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes.as_slice());
+    A::deserialize(ListDeserializer(&mut decoder)).map_err(|_| crate::Error::InvalidParams)
+}
+
+struct EmptyList;
+impl<'de> serde::de::Visitor<'de> for EmptyList {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an empty argument list")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            Err(serde::de::Error::custom(
+                "unit arguments require an empty array",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for ListDeserializer<D> {
+    type Error = D::Error;
 
     fn deserialize_any<V: serde::de::Visitor<'de>>(
         self,
@@ -31,13 +57,8 @@ impl<'de> serde::Deserializer<'de> for ListDeserializer {
         self,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        if matches!(self.0, crate::Value::Array(ref args) if args.is_empty()) {
-            visitor.visit_unit()
-        } else {
-            Err(serde::de::Error::custom(
-                "unit arguments require an empty array",
-            ))
-        }
+        self.0.deserialize_seq(EmptyList)?;
+        visitor.visit_unit()
     }
 
     fn deserialize_unit_struct<V: serde::de::Visitor<'de>>(

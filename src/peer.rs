@@ -292,7 +292,7 @@ impl RpcPeer {
         )?;
         self.shared.commit(permit, frame, Some(id))?;
         let value = receiver.await.map_err(|_| self.shared.terminal())??;
-        wire::decode(value)
+        wire::decode(value, self.shared.config.max_incoming_bytes)
     }
 }
 

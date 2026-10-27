@@ -147,7 +147,9 @@ incoming byte length. Decoded values have count and nesting bounds; these are no
 a bound on allocator overhead or application memory.
 
 Encoding enforces the outgoing byte limit as bytes are written, including methods
-and error values. Argument/result conversion also checks depth and node budgets
+and error values. Unknown-length sequences and maps (including Serde flatten) use
+the same bounded sink, with five-byte container headers patched at completion;
+no unbounded intermediate serialization buffer is used. Argument/result conversion also checks depth and node budgets
 before creating dynamic values; the final outgoing envelope is byte bounded.
 Rejected calls and notifications send no partial frame. Oversized or unserializable
 results produce a generic remote failure; oversized error envelopes fall back to
