@@ -12,7 +12,9 @@ pub use config::Config;
 mod error;
 mod peer;
 mod registry;
+mod transport;
 mod wire;
+pub use transport::SplitIo;
 
 pub use error::{Error, RemoteError};
 pub use peer::{Connection, HandlerContext, RpcPeer};
