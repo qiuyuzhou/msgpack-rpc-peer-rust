@@ -14,4 +14,8 @@ tokio = { version = "1.53", features = ["io-util", "rt", "sync", "macros"] }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.53", features = ["time"] }
+tokio = { version = "1.53", features = ["time", "net", "process", "io-std"] }
+
+[[test]]
+name = "subprocess"
+harness = false
