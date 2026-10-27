@@ -249,8 +249,9 @@ pub(crate) fn value(bytes: Vec<u8>, config: &crate::Config) -> Result<Value, Err
     .map_err(|_| Error::Encode("invalid serialized value".into()))
 }
 
-pub(crate) fn decode<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
-    rmpv::ext::from_value(value).map_err(|_| Error::InvalidResult)
+pub(crate) fn decode<T: DeserializeOwned>(value: Value, limit: usize) -> Result<T, Error> {
+    let bytes = encode(&value, limit).map_err(|_| Error::InvalidResult)?;
+    rmp_serde::from_slice(&bytes).map_err(|_| Error::InvalidResult)
 }
 
 pub(crate) fn response(

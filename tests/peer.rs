@@ -186,3 +186,37 @@ async fn notification_registration_and_arguments_are_validated() {
     connection.wait().await.unwrap();
     assert_eq!(peer.notify("event", ()).await, Err(Error::Closed));
 }
+
+#[tokio::test]
+async fn typed_enums_decode_inside_argument_lists_and_results() {
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Choice {
+        Unit,
+        Newtype(u32),
+        Tuple(u32, bool),
+        Struct { n: u32 },
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (left, right) = tokio::io::duplex(256);
+        let (peer, owner) = RpcPeer::builder().start(left).unwrap();
+        let (_, remote) = RpcPeer::builder()
+            .method("echo", |_, (value,): (Choice,)| async move { Ok(value) })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        for value in [
+            Choice::Unit,
+            Choice::Newtype(4),
+            Choice::Tuple(2, true),
+            Choice::Struct { n: 9 },
+        ] {
+            let result: Choice = peer.request("echo", (value.clone(),)).await.unwrap();
+            assert_eq!(result, value);
+        }
+        owner.terminate();
+        owner.wait().await.unwrap();
+        remote.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
