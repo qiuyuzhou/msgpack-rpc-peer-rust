@@ -1,0 +1,3 @@
+# Bound the whole local call and preserve in-flight framing
+
+A call timeout covers its asynchronous execution, including waiting for outgoing capacity, with a finite configurable default and per-call overrides. Dropping or timing out a call removes its pending entry; once transmission starts, the writer finishes that message to preserve framing, so the remote operation may still execute. Late responses are discarded, and outgoing message IDs increase without reuse during a connection; exhaustion of the unsigned 32-bit namespace rejects new calls rather than risking correlation with stale responses.
