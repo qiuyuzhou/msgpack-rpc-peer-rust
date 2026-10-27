@@ -1,12 +1,12 @@
 #![doc = include_str!("../README.md")]
 
-mod arguments;
 mod config;
 mod encoding;
 mod error;
 mod peer;
 mod registry;
 mod transport;
+mod typed;
 mod wire;
 pub use transport::SplitIo;
 

@@ -32,6 +32,29 @@ async fn typed_requests_work_in_both_directions() {
 }
 
 #[tokio::test]
+async fn result_type_mismatch_leaves_the_connection_usable() {
+    timeout(Duration::from_secs(3), async {
+        let (left, right) = tokio::io::duplex(128);
+        let (peer, owner) = RpcPeer::builder().start(left).unwrap();
+        let (_, remote) = RpcPeer::builder()
+            .method("answer", |_, (): ()| async { Ok(42u32) })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        assert_eq!(
+            peer.request::<_, String>("answer", ()).await,
+            Err(Error::InvalidResult)
+        );
+        assert_eq!(peer.request::<_, u32>("answer", ()).await, Ok(42));
+        owner.terminate();
+        owner.wait().await.unwrap();
+        remote.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn scalar_and_map_arguments_are_rejected_locally() {
     let (stream, _raw) = tokio::io::duplex(128);
     let (peer, connection) = RpcPeer::builder().start(stream).unwrap();

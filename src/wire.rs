@@ -1,6 +1,5 @@
 use std::io::Cursor;
 
-use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Error, Value};
@@ -247,11 +246,6 @@ pub(crate) fn value(bytes: Vec<u8>, config: &crate::Config) -> Result<Value, Err
         config.max_depth * 2 + 3,
     )
     .map_err(|_| Error::Encode("invalid serialized value".into()))
-}
-
-pub(crate) fn decode<T: DeserializeOwned>(value: Value, limit: usize) -> Result<T, Error> {
-    let bytes = encode(&value, limit).map_err(|_| Error::InvalidResult)?;
-    rmp_serde::from_slice(&bytes).map_err(|_| Error::InvalidResult)
 }
 
 pub(crate) fn response(

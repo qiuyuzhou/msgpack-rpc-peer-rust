@@ -16,8 +16,8 @@ use tokio::{
 
 use crate::{
     DiagnosticEvent, DiagnosticEvents, DiagnosticsSnapshot, Error, PeerBuilder, RemoteError, Value,
-    arguments::Arguments,
     diagnostics::Diagnostics,
+    typed,
     wire::{self, Message},
 };
 
@@ -178,9 +178,7 @@ impl RpcPeer {
             .reserve()
             .await
             .map_err(|_| self.shared.terminal())?;
-        let args = wire::encode(&Arguments(args), self.shared.config.max_outgoing_bytes)
-            .map_err(|_| Error::InvalidParams)?;
-        let params = wire::value(args, &self.shared.config).map_err(|_| Error::InvalidParams)?;
+        let params = typed::encode_args(args, &self.shared.config)?;
         let frame = wire::encode(
             &(2u8, method, params),
             self.shared.config.max_outgoing_bytes,

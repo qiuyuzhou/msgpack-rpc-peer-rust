@@ -788,6 +788,42 @@ async fn bounded_encoding_preserves_enum_binary_and_extension_contracts() {
 }
 
 #[tokio::test]
+async fn request_envelope_limit_is_distinct_from_invalid_arguments() {
+    use msgpack_rpc_peer::Config;
+    timeout(Duration::from_secs(3), async {
+        let (stream, mut raw) = tokio::io::duplex(64);
+        let (peer, owner) = RpcPeer::builder()
+            .config(Config {
+                max_outgoing_bytes: 6,
+                ..Config::default()
+            })
+            .start(stream)
+            .unwrap();
+        assert_eq!(
+            peer.request::<_, ()>("x", 7).await,
+            Err(Error::InvalidParams)
+        );
+        assert!(matches!(
+            peer.request::<_, ()>("xx", ()).await,
+            Err(Error::Encode(_))
+        ));
+        let calling = peer.request::<_, u32>("x", ());
+        let remote = async {
+            let mut frame = [0; 6];
+            raw.read_exact(&mut frame).await.unwrap();
+            assert_eq!(&frame, b"\x94\x00\x02\xa1x\x90");
+            raw.write_all(b"\x94\x01\x02\xc0\x2a").await.unwrap();
+        };
+        let (result, ()) = tokio::join!(calling, remote);
+        assert_eq!(result, Ok(42));
+        owner.terminate();
+        owner.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn complete_outgoing_envelopes_accept_the_exact_byte_limit() {
     use msgpack_rpc_peer::Config;
     timeout(Duration::from_secs(3), async {

@@ -1,10 +1,48 @@
 use serde::{
     Serialize, Serializer,
+    de::DeserializeOwned,
     ser::{Error, SerializeTuple},
 };
 
+use crate::{Config, Error as RpcError, RemoteError, Value, wire};
+
+pub(crate) fn encode_args<A: Serialize>(args: A, config: &Config) -> Result<Value, RpcError> {
+    let bytes = wire::encode(&Arguments(args), config.max_outgoing_bytes)
+        .map_err(|_| RpcError::InvalidParams)?;
+    wire::value(bytes, config).map_err(|_| RpcError::InvalidParams)
+}
+
+pub(crate) fn decode_args<A: DeserializeOwned>(
+    params: Value,
+    limit: usize,
+) -> Result<A, RemoteError> {
+    let bytes = wire::encode(&params, limit)
+        .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
+    let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes.as_slice());
+    A::deserialize(ListDeserializer(&mut decoder))
+        .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))
+}
+
+pub(crate) fn encode_result<R: Serialize>(
+    result: R,
+    config: &Config,
+) -> Result<Value, RemoteError> {
+    let bytes = wire::encode(&result, config.max_outgoing_bytes)
+        .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))?;
+    wire::value(bytes, config)
+        .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))
+}
+
+pub(crate) fn decode_result<R: DeserializeOwned>(
+    value: Value,
+    limit: usize,
+) -> Result<R, RpcError> {
+    let bytes = wire::encode(&value, limit).map_err(|_| RpcError::InvalidResult)?;
+    rmp_serde::from_slice(&bytes).map_err(|_| RpcError::InvalidResult)
+}
+
 /// Adapts only the outer argument list; the underlying serializer handles values.
-pub(crate) struct Arguments<T>(pub T);
+struct Arguments<T>(T);
 
 impl<T: Serialize> Serialize for Arguments<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -16,15 +54,6 @@ struct ListSerializer<S>(S);
 
 /// Enforce the same outer list contract when decoding handler arguments.
 struct ListDeserializer<D>(D);
-
-pub(crate) fn decode<A: serde::de::DeserializeOwned>(
-    params: crate::Value,
-    limit: usize,
-) -> Result<A, crate::Error> {
-    let bytes = crate::wire::encode(&params, limit).map_err(|_| crate::Error::InvalidParams)?;
-    let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes.as_slice());
-    A::deserialize(ListDeserializer(&mut decoder)).map_err(|_| crate::Error::InvalidParams)
-}
 
 struct EmptyList;
 impl<'de> serde::de::Visitor<'de> for EmptyList {

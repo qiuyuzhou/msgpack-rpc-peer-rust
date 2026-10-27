@@ -4,7 +4,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::Shared;
-use crate::{Error, Value, arguments::Arguments, wire};
+use crate::{Error, Value, typed, wire};
 
 type Reply = oneshot::Sender<Result<Value, Error>>;
 
@@ -81,9 +81,7 @@ impl OutgoingRequest {
             .reserve()
             .await
             .map_err(|_| self.shared.terminal())?;
-        let args = wire::encode(&Arguments(args), self.shared.config.max_outgoing_bytes)
-            .map_err(|_| Error::InvalidParams)?;
-        let params = wire::value(args, &self.shared.config).map_err(|_| Error::InvalidParams)?;
+        let params = typed::encode_args(args, &self.shared.config)?;
         let frame = wire::encode(
             &(0u8, self.id, method, params),
             self.shared.config.max_outgoing_bytes,
@@ -92,7 +90,7 @@ impl OutgoingRequest {
         let value = (&mut self.receiver)
             .await
             .map_err(|_| self.shared.terminal())??;
-        wire::decode(value, self.shared.config.max_incoming_bytes)
+        typed::decode_result(value, self.shared.config.max_incoming_bytes)
     }
 }
 

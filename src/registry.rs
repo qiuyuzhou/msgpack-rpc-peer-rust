@@ -3,7 +3,7 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{Connection, Error, HandlerContext, RemoteError, RpcPeer, Value, wire};
+use crate::{Connection, Error, HandlerContext, RemoteError, RpcPeer, Value, typed};
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send>>;
 pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + Send + Sync>;
@@ -95,16 +95,8 @@ where
         let handler = handler.clone();
         Box::pin(async move {
             let config = context.config().clone();
-            let args = crate::arguments::decode::<A>(params, config.max_incoming_bytes)
-                .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
-            encode_result(handler(context, args).await?, &config)
+            let args = typed::decode_args::<A>(params, config.max_incoming_bytes)?;
+            typed::encode_result(handler(context, args).await?, &config)
         })
     })
-}
-
-fn encode_result<R: Serialize>(result: R, config: &crate::Config) -> Result<Value, RemoteError> {
-    let bytes = wire::encode(&result, config.max_outgoing_bytes)
-        .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))?;
-    wire::value(bytes, config)
-        .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))
 }

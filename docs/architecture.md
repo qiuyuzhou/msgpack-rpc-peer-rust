@@ -14,6 +14,8 @@ Calls and notifications accept explicit tuple or sequence argument lists; handle
 
 Generic `AsyncRead + AsyncWrite + Unpin + Send + 'static` streams are accepted directly. A small adapter pairs separate read and write halves for subprocess stdio. Unix sockets require no special RPC implementation. The library creates no runtime and owns no child process.
 
+A private typed conversion module owns argument-list encoding and decoding, result encoding and decoding, and their error mappings. List adapters remain internal to that module; bounded byte encoding, message validation and response-envelope fallback remain separate.
+
 ## Execution and ownership
 
 A reader incrementally frames and validates incoming messages, correlates responses, and admits incoming handlers without awaiting handler capacity or write capacity. A single writer fairly services bounded application and response queues and completes each started frame. A supervisor owns reader, writer, and handler tasks; no handler or transport task is detached from its lifecycle.
