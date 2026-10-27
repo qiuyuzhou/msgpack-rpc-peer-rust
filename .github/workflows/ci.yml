@@ -17,6 +17,19 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  cargo-deny:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   quality:
     name: Format, lint, and docs
     runs-on: ubuntu-latest
