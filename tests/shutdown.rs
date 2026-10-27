@@ -222,3 +222,79 @@ async fn invalid_shutdown_deadlines_fail_without_panicking() {
         Err(Error::InvalidConfig(_))
     ));
 }
+
+#[tokio::test]
+async fn a_notification_does_not_commit_after_terminal_cleanup() {
+    use std::sync::Mutex;
+    struct PausedSerialization {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl serde::Serialize for PausedSerialization {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.release.recv().unwrap();
+            serializer.serialize_unit()
+        }
+    }
+    timeout(Duration::from_secs(3), async {
+        let (stream, _raw) = tokio::io::duplex(64);
+        let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sending = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(peer.notify(
+                    "x",
+                    PausedSerialization {
+                        started: Mutex::new(Some(started_tx)),
+                        release: release_rx,
+                    },
+                ))
+        });
+        started_rx.await.unwrap();
+        connection.terminate();
+        connection.wait().await.unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(sending.join().unwrap(), Err(Error::Closed));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn responses_progress_during_continuous_application_notifications() {
+    timeout(Duration::from_secs(3), async {
+        let (left, right) = tokio::io::duplex(1024 * 1024);
+        let (peer, owner) = RpcPeer::builder().start(left).unwrap();
+        let (_, remote_owner) = RpcPeer::builder()
+            .method("x", |_, (): ()| async { Ok(1u32) })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        let producer_peer = peer.clone();
+        let producer =
+            tokio::spawn(async move { while producer_peer.notify("n", ()).await.is_ok() {} });
+        let result = peer
+            .request_with_timeout::<_, u32>("x", (), Duration::from_millis(100))
+            .await;
+        producer.abort();
+        let _ = producer.await;
+        owner.terminate();
+        owner.wait().await.unwrap();
+        remote_owner.terminate();
+        remote_owner.wait().await.unwrap();
+        assert_eq!(result, Ok(1));
+    })
+    .await
+    .unwrap();
+}
