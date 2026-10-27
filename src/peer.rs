@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +24,7 @@ use crate::{
 struct Outgoing {
     bytes: Vec<u8>,
     request_id: Option<u32>,
+    _incoming: Option<IncomingGuard>,
     _frame: WorkGuard,
 }
 
@@ -32,6 +33,7 @@ type Reply = oneshot::Sender<Result<Value, Error>>;
 struct State {
     next_id: u64,
     pending: HashMap<u32, Reply>,
+    incoming: HashSet<u32>,
     terminal: Option<Error>,
     drain_deadline: Option<tokio::time::Instant>,
     operations: usize,
@@ -70,6 +72,7 @@ impl Shared {
         Outgoing {
             bytes,
             request_id,
+            _incoming: None,
             _frame: WorkGuard {
                 shared: self.clone(),
                 frame: true,
@@ -92,6 +95,7 @@ impl Shared {
         permit.send(Outgoing {
             bytes,
             request_id,
+            _incoming: None,
             _frame: WorkGuard {
                 shared: self.clone(),
                 frame: true,
@@ -145,6 +149,16 @@ impl Drop for HandlerLease {
     fn drop(&mut self) {
         let _state = self.shared.state.lock().unwrap();
         self.active.store(false, Ordering::Relaxed);
+    }
+}
+
+struct IncomingGuard {
+    shared: Arc<Shared>,
+    id: u32,
+}
+impl Drop for IncomingGuard {
+    fn drop(&mut self) {
+        self.shared.state.lock().unwrap().incoming.remove(&self.id);
     }
 }
 
@@ -423,6 +437,7 @@ where
         state: Mutex::new(State {
             next_id: 0,
             pending: HashMap::new(),
+            incoming: HashSet::new(),
             terminal: None,
             drain_deadline: None,
             operations: 0,
@@ -489,6 +504,7 @@ fn respond(
     outcome: Result<Value, RemoteError>,
     limit: usize,
     shared: &Arc<Shared>,
+    incoming: IncomingGuard,
 ) -> Result<(), Error> {
     let frame = wire::response(id, outcome, limit).or_else(|_| {
         wire::response(
@@ -500,8 +516,10 @@ fn respond(
             limit,
         )
     })?;
+    let mut frame = shared.frame(frame, None);
+    frame._incoming = Some(incoming);
     responses
-        .try_send(shared.frame(frame, None))
+        .try_send(frame)
         .map_err(|_| Error::ResourceLimit("response queue"))
 }
 
@@ -527,7 +545,7 @@ where
     let (mut reader, write_half) = tokio::io::split(stream);
     let (responses, mut response_rx) = mpsc::channel(builder.config.response_queue_capacity);
     let mut handlers = JoinSet::new();
-    let mut active: HashMap<Id, Option<u32>> = HashMap::new();
+    let mut active: HashMap<Id, Option<IncomingGuard>> = HashMap::new();
     let mut buffer = wire::Decoder::default();
     let terminal = {
         let writing = writer(write_half, &mut application, &peer.shared, &mut response_rx);
@@ -578,8 +596,8 @@ where
                     if incoming_id.is_none() && outcome.is_err() && !panicked {
                         peer.shared.diagnostics.record(DiagnosticEvent::NotificationFailed);
                     }
-                    if let Some(id) = incoming_id {
-                        if let Err(error) = respond(&responses, id, outcome, builder.config.max_outgoing_bytes, &peer.shared) { break error; }
+                    if let Some(incoming) = incoming_id {
+                        if let Err(error) = respond(&responses, incoming.id, outcome, builder.config.max_outgoing_bytes, &peer.shared, incoming) { break error; }
                     }
                 }
                 Event::Message(message) => {
@@ -589,20 +607,21 @@ where
                             if let Some(reply) = peer.shared.state.lock().unwrap().pending.remove(&id) { let _ = reply.send(outcome); }
                         }
                         Ok(Message::Request { id, method, params }) => {
-                            if active.values().any(|active_id| *active_id == Some(id)) { break Error::Protocol("duplicate active request ID"); }
+                            if !peer.shared.state.lock().unwrap().incoming.insert(id) { break Error::Protocol("duplicate active request ID"); }
+                            let incoming = IncomingGuard { shared: peer.shared.clone(), id };
                             let Some(handler) = builder.methods.get(&method).cloned() else {
-                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method")), builder.config.max_outgoing_bytes, &peer.shared) { break error; }
+                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method")), builder.config.max_outgoing_bytes, &peer.shared, incoming) { break error; }
                                 continue;
                             };
                             if handlers.len() >= builder.config.max_handlers {
-                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32000, "handler capacity exhausted")), builder.config.max_outgoing_bytes, &peer.shared) { break error; }
+                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32000, "handler capacity exhausted")), builder.config.max_outgoing_bytes, &peer.shared, incoming) { break error; }
                                 continue;
                             }
                             let active_lease = Arc::new(AtomicBool::new(true));
                             let context = HandlerContext { peer: peer.clone(), active: active_lease.clone() };
                             let lease = HandlerLease { shared: peer.shared.clone(), active: active_lease };
                             let task = handlers.spawn(async move { let _lease = lease; handler(context, params).await });
-                            active.insert(task.id(), Some(id));
+                            active.insert(task.id(), Some(incoming));
                         }
                         Ok(Message::Notification { method, params }) => {
                             if handlers.len() >= builder.config.max_handlers {
