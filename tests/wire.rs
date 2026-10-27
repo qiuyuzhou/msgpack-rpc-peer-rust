@@ -1,4 +1,4 @@
-use msgpack_rpc_peer::{Error, RpcPeer};
+use msgpack_rpc_peer::{Error, RpcParams, RpcPeer};
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -9,6 +9,12 @@ use tokio::{
 struct Person {
     name: &'static str,
 }
+
+/// Satisfies the compile-time params contract but serializes a bare scalar,
+/// exercising the runtime shape check.
+#[derive(Serialize)]
+struct ScalarParams(u32);
+impl RpcParams for ScalarParams {}
 
 #[tokio::test]
 async fn outgoing_requests_match_literal_fixtures_and_preserve_remote_errors() {
@@ -800,7 +806,7 @@ async fn request_envelope_limit_is_distinct_from_invalid_arguments() {
             .start(stream)
             .unwrap();
         assert_eq!(
-            peer.request::<_, ()>("x", 7).await,
+            peer.request::<_, ()>("x", ScalarParams(7)).await,
             Err(Error::InvalidParams)
         );
         assert!(matches!(

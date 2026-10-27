@@ -1,4 +1,4 @@
-use msgpack_rpc_peer::{Error, RemoteError, RpcPeer};
+use msgpack_rpc_peer::{Error, RemoteError, RpcParams, RpcPeer};
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
@@ -55,20 +55,33 @@ async fn result_type_mismatch_leaves_the_connection_usable() {
 }
 
 #[tokio::test]
-async fn scalar_and_map_arguments_are_rejected_locally() {
+async fn custom_params_with_invalid_shapes_are_rejected_at_runtime() {
+    #[derive(serde::Serialize)]
+    struct ScalarParams(u32);
+    impl RpcParams for ScalarParams {}
+
+    #[derive(serde::Serialize)]
+    struct MapParams {
+        n: u32,
+    }
+    impl RpcParams for MapParams {}
+
     let (stream, _raw) = tokio::io::duplex(128);
     let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
     assert_eq!(
-        peer.request::<_, ()>("method", 7).await,
+        peer.request::<_, ()>("method", ScalarParams(7)).await,
         Err(Error::InvalidParams)
     );
     assert_eq!(
-        peer.request::<_, ()>("method", std::collections::BTreeMap::from([("n", 7)]))
-            .await,
+        peer.request::<_, ()>("method", MapParams { n: 7 }).await,
         Err(Error::InvalidParams)
     );
     assert_eq!(
-        peer.request::<_, ()>("method", None::<u32>).await,
+        peer.notify("method", ScalarParams(7)).await,
+        Err(Error::InvalidParams)
+    );
+    assert_eq!(
+        peer.notify("method", MapParams { n: 7 }).await,
         Err(Error::InvalidParams)
     );
     connection.terminate();
@@ -164,9 +177,9 @@ async fn handlers_require_explicit_argument_lists() {
                 |_, (value,): (Option<u32>,)| async move { Ok(value) },
             )
             .unwrap()
-            .method("vec", |_, args: Vec<u32>| async move { Ok(args) })
+            .method("vec", |_, params: Vec<u32>| async move { Ok(params) })
             .unwrap()
-            .method("array", |_, args: [u32; 2]| async move { Ok(args) })
+            .method("array", |_, params: [u32; 2]| async move { Ok(params) })
             .unwrap()
             .start(right)
             .unwrap();
@@ -213,7 +226,7 @@ async fn handlers_require_explicit_argument_lists() {
 }
 
 #[tokio::test]
-async fn notification_registration_and_arguments_are_validated() {
+async fn duplicate_notification_names_fail_and_closed_peers_reject_notifications() {
     assert!(matches!(
         RpcPeer::builder()
             .notification("event", |_, (): ()| async { Ok(()) })
@@ -223,16 +236,6 @@ async fn notification_registration_and_arguments_are_validated() {
     ));
     let (stream, _raw) = tokio::io::duplex(128);
     let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
-    assert_eq!(peer.notify("event", 7).await, Err(Error::InvalidParams));
-    assert_eq!(
-        peer.notify("event", None::<u32>).await,
-        Err(Error::InvalidParams)
-    );
-    assert_eq!(
-        peer.notify("event", std::collections::BTreeMap::from([("n", 7)]))
-            .await,
-        Err(Error::InvalidParams)
-    );
     connection.terminate();
     connection.wait().await.unwrap();
     assert_eq!(peer.notify("event", ()).await, Err(Error::Closed));

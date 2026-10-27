@@ -4,7 +4,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::Shared;
-use crate::{Error, Value, typed, wire};
+use crate::{Error, RpcParams, Value, typed, wire};
 
 type Reply = oneshot::Sender<Result<Value, Error>>;
 
@@ -70,10 +70,10 @@ impl OutgoingRequest {
         })
     }
 
-    pub(super) async fn send<A: Serialize, R: DeserializeOwned>(
+    pub(super) async fn send<P: RpcParams + Serialize, R: DeserializeOwned>(
         mut self,
         method: &str,
-        args: A,
+        params: P,
     ) -> Result<R, Error> {
         let permit = self
             .shared
@@ -81,9 +81,9 @@ impl OutgoingRequest {
             .reserve()
             .await
             .map_err(|_| self.shared.terminal())?;
-        let params = typed::encode_args(args, &self.shared.config)?;
+        let encoded = typed::encode_params(params, &self.shared.config)?;
         let frame = wire::encode(
-            &(0u8, self.id, method, params),
+            &(0u8, self.id, method, encoded),
             self.shared.config.max_outgoing_bytes,
         )?;
         self.shared.commit(permit, frame, Some(self.id))?;

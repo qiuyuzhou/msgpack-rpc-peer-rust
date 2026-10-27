@@ -26,7 +26,7 @@ use std::time::Duration;
 /// decoded containers, and rejects hostile advertised string, binary,
 /// extension, array, and map lengths against the byte and node budgets.
 /// Encoded buffering is bounded by `max_incoming_bytes`, and fragmented or
-/// concatenated objects need no delimiter or length prefix. Arguments and
+/// concatenated objects need no delimiter or length prefix. Params and
 /// results also pass depth and node checks before conversion to dynamic
 /// values, and the complete outgoing envelope stays within the byte limit
 /// during serialization. Unknown-length Serde sequences, maps, and formatted

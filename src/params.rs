@@ -1,15 +1,23 @@
-use serde::de::DeserializeOwned;
-
-/// A handler's MessagePack-RPC `params` array.
+/// The MessagePack-RPC `params` array shape shared by handlers and outgoing
+/// calls.
 ///
-/// Implemented for `()`, tuples of 1–16 elements, `Vec<T>`, and arrays that
-/// implement `DeserializeOwned`. Use `()` for no parameters, `(T,)` for one,
-/// and `(T, U)` for two. Each element can be any owned deserializable type,
-/// including a struct, map, or option.
+/// Implemented for `()`, tuples of 1–16 elements, `Vec<T>`, and arrays. Use
+/// `()` for no params, `(T,)` for one, and `(T, U)` for two. Each element can
+/// be any owned type, including a struct, map, or option. Builder handlers
+/// require elements that implement
+/// [`DeserializeOwned`](serde::de::DeserializeOwned), and outgoing
+/// [`notify`](crate::RpcPeer::notify) and [`request`](crate::RpcPeer::request)
+/// calls require elements that implement [`Serialize`](serde::Serialize).
 ///
-/// Custom types may implement this trait if they deserialize from the entire
-/// `params` array. This marker does not verify custom deserialization behavior;
-/// incoming parameter values and counts are still checked at runtime.
+/// Scalars, maps, ordinary structs, options, and nil do not implement
+/// `RpcParams`, so they fail at compile time on both sides. Wrap a single
+/// value in a one-element tuple.
+///
+/// Custom types may implement this trait if they convert the entire `params`
+/// array. This marker does not verify custom conversion behavior; incoming
+/// parameter values and counts are still checked at runtime, and an outgoing
+/// implementation that does not serialize an array fails at runtime as
+/// [`Error::InvalidParams`](crate::Error::InvalidParams).
 ///
 /// ```
 /// use msgpack_rpc_peer::{RpcParams, RpcPeer};
@@ -25,8 +33,17 @@ use serde::de::DeserializeOwned;
 ///     .notification("event", |_, _: [u32; 2]| async { Ok(()) }).unwrap();
 /// ```
 ///
-/// Scalars, maps, ordinary structs, and options do not implement `RpcParams`
-/// by default. Wrap a single value in a one-element tuple:
+/// The same contract constrains outgoing calls:
+///
+/// ```compile_fail
+/// use msgpack_rpc_peer::RpcPeer;
+/// async fn demo(peer: RpcPeer) {
+///     let _ = peer.request::<_, ()>("echo", 7u32).await;
+/// }
+/// ```
+///
+/// Scalars, maps, structs, and options do not implement `RpcParams` for
+/// handlers either:
 ///
 /// ```compile_fail
 /// use msgpack_rpc_peer::RpcPeer;
@@ -57,19 +74,18 @@ use serde::de::DeserializeOwned;
 /// use msgpack_rpc_peer::RpcPeer;
 /// RpcPeer::builder().notification("scalar", |_, _: u32| async { Ok(()) });
 /// ```
-pub trait RpcParams: DeserializeOwned {}
+pub trait RpcParams {}
 
 impl RpcParams for () {}
-impl<T: DeserializeOwned> RpcParams for Vec<T> {}
-impl<T, const N: usize> RpcParams for [T; N] where [T; N]: DeserializeOwned {}
+impl<T> RpcParams for Vec<T> {}
+impl<T, const N: usize> RpcParams for [T; N] {}
 
-macro_rules! tuple_args {
+macro_rules! tuple_params {
     ($head:ident $(, $tail:ident)*) => {
-        impl<$head: DeserializeOwned, $($tail: DeserializeOwned),*> RpcParams
-            for ($head, $($tail,)*) {}
-        tuple_args!($($tail),*);
+        impl<$head, $($tail),*> RpcParams for ($head, $($tail,)*) {}
+        tuple_params!($($tail),*);
     };
     () => {};
 }
 
-tuple_args!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+tuple_params!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);

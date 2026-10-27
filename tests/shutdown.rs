@@ -1,4 +1,4 @@
-use msgpack_rpc_peer::{Error, RpcPeer};
+use msgpack_rpc_peer::{Error, RpcParams, RpcPeer};
 use tokio::{
     io::AsyncReadExt,
     time::{Duration, timeout},
@@ -63,6 +63,7 @@ async fn notifications_wait_for_a_queue_reservation_before_serializing() {
             serializer.serialize_unit()
         }
     }
+    impl RpcParams for Observed {}
     timeout(Duration::from_secs(3), async {
         let (stream,mut raw) = tokio::io::duplex(1);
         let (peer,connection) = RpcPeer::builder().config(msgpack_rpc_peer::Config { application_queue_capacity:1, ..Default::default() }).start(stream).unwrap();
@@ -242,6 +243,7 @@ async fn termination_during_serialization(request: bool) {
             serializer.serialize_unit()
         }
     }
+    impl RpcParams for PausedSerialization {}
     timeout(Duration::from_secs(3), async {
         let (stream, _raw) = tokio::io::duplex(64);
         let (peer, connection) = RpcPeer::builder().start(stream).unwrap();

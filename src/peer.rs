@@ -15,7 +15,8 @@ use tokio::{
 };
 
 use crate::{
-    DiagnosticEvent, DiagnosticEvents, DiagnosticsSnapshot, Error, PeerBuilder, RemoteError, Value,
+    DiagnosticEvent, DiagnosticEvents, DiagnosticsSnapshot, Error, PeerBuilder, RemoteError,
+    RpcParams, Value,
     diagnostics::Diagnostics,
     typed,
     wire::{self, Message},
@@ -165,22 +166,37 @@ impl RpcPeer {
         PeerBuilder::default()
     }
 
-    /// Queue a one-way notification with an explicit argument list.
+    /// Queue a one-way notification with typed params.
     ///
     /// A successful await means the notification is queued locally; it does
     /// not confirm remote delivery, execution, or success. Notifications
     /// consume no request ID or pending-call slot and never receive responses.
     /// The remote peer ignores unknown notification names, and invalid typed
-    /// arguments and other notification failures are counted in its own
+    /// params and other notification failures are counted in its own
     /// diagnostics. Waits for bounded outgoing capacity.
-    pub async fn notify<A: Serialize>(&self, method: &str, args: A) -> Result<(), Error> {
-        self.notify_inner(method, args, None).await
-    }
-
-    async fn notify_inner<A: Serialize>(
+    ///
+    /// Params follow [`RpcParams`]: `()` for none, `(value,)` for one, and
+    /// `(first, second)` for two. Scalars, maps, structs, options, and nil
+    /// fail to compile:
+    ///
+    /// ```compile_fail
+    /// use msgpack_rpc_peer::RpcPeer;
+    /// async fn demo(peer: RpcPeer) {
+    ///     let _ = peer.notify("event", 7u32).await;
+    /// }
+    /// ```
+    pub async fn notify<P: RpcParams + Serialize>(
         &self,
         method: &str,
-        args: A,
+        params: P,
+    ) -> Result<(), Error> {
+        self.notify_inner(method, params, None).await
+    }
+
+    async fn notify_inner<P: RpcParams + Serialize>(
+        &self,
+        method: &str,
+        params: P,
         lease: Option<&AtomicBool>,
     ) -> Result<(), Error> {
         let _operation = self.shared.admit(lease)?;
@@ -190,21 +206,23 @@ impl RpcPeer {
             .reserve()
             .await
             .map_err(|_| self.shared.terminal())?;
-        let params = typed::encode_args(args, &self.shared.config)?;
+        let encoded = typed::encode_params(params, &self.shared.config)?;
         let frame = wire::encode(
-            &(2u8, method, params),
+            &(2u8, method, encoded),
             self.shared.config.max_outgoing_bytes,
         )?;
         self.shared.commit(permit, frame, None)
     }
 
-    /// Send an explicit argument list and decode a typed result.
+    /// Send typed params and decode a typed result.
     ///
-    /// Arguments are tuples or sequences: `()` for none, `(value,)` for one,
-    /// and `(first, second)` for two. Top-level scalars, maps, structs, and
-    /// nil are rejected as [`Error::InvalidParams`]. A structured argument
-    /// goes inside the list as `(MyArguments { ... },)` and encodes with named
-    /// fields. The result can be any supported Serde value; use [`Value`] for
+    /// Params are tuples or sequences: `()` for none, `(value,)` for one,
+    /// and `(first, second)` for two. Scalars, maps, structs, options, and
+    /// nil do not implement [`RpcParams`] and fail to compile. A structured
+    /// value goes inside the list as `(MyParams { ... },)` and encodes
+    /// with named fields. A custom [`RpcParams`] implementation that does not
+    /// serialize an array still fails at runtime as [`Error::InvalidParams`].
+    /// The result can be any supported Serde value; use [`Value`] for
     /// arbitrary MessagePack data.
     ///
     /// The call uses [`Config::default_call_timeout`](crate::Config::default_call_timeout)
@@ -219,12 +237,12 @@ impl RpcPeer {
     /// active, preserving framing, so local cancellation cannot prevent remote
     /// side effects. Late and unmatched responses are discarded.
     /// [`Error::Timeout`] leaves the connection usable.
-    pub async fn request<A: Serialize, R: DeserializeOwned>(
+    pub async fn request<P: RpcParams + Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
-        args: A,
+        params: P,
     ) -> Result<R, Error> {
-        self.request_with_timeout(method, args, self.shared.config.default_call_timeout)
+        self.request_with_timeout(method, params, self.shared.config.default_call_timeout)
             .await
     }
 
@@ -233,40 +251,40 @@ impl RpcPeer {
     /// The deadline cannot preempt synchronous Serde code or handler code.
     /// Cancellation is local: a started request may still execute remotely.
     /// [`Error::Timeout`] leaves the connection usable.
-    pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
+    pub async fn request_with_timeout<P: RpcParams + Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
-        args: A,
+        params: P,
         timeout: Duration,
     ) -> Result<R, Error> {
-        self.request_timed(method, args, timeout, None).await
+        self.request_timed(method, params, timeout, None).await
     }
 
-    async fn request_timed<A: Serialize, R: DeserializeOwned>(
+    async fn request_timed<P: RpcParams + Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
-        args: A,
+        params: P,
         timeout: Duration,
         lease: Option<&AtomicBool>,
     ) -> Result<R, Error> {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
-        tokio::time::timeout_at(deadline, self.request_inner(method, args, lease))
+        tokio::time::timeout_at(deadline, self.request_inner(method, params, lease))
             .await
             .map_err(|_| Error::Timeout)?
     }
 
-    async fn request_inner<A: Serialize, R: DeserializeOwned>(
+    async fn request_inner<P: RpcParams + Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
-        args: A,
+        params: P,
         lease: Option<&AtomicBool>,
     ) -> Result<R, Error> {
         let _operation = self.shared.admit(lease)?;
         OutgoingRequest::begin(&self.shared)
             .await?
-            .send(method, args)
+            .send(method, params)
             .await
     }
 }
@@ -292,22 +310,26 @@ impl HandlerContext {
     }
 
     /// Queue a notification while incoming messages continue to be processed.
-    pub async fn notify<A: Serialize>(&self, method: &str, args: A) -> Result<(), Error> {
+    pub async fn notify<P: RpcParams + Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<(), Error> {
         self.peer
-            .notify_inner(method, args, Some(&self.active))
+            .notify_inner(method, params, Some(&self.active))
             .await
     }
 
     /// Issue a request while the connection continues processing responses.
-    pub async fn request<A: Serialize, R: DeserializeOwned>(
+    pub async fn request<P: RpcParams + Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
-        args: A,
+        params: P,
     ) -> Result<R, Error> {
         self.peer
             .request_timed(
                 method,
-                args,
+                params,
                 self.peer.shared.config.default_call_timeout,
                 Some(&self.active),
             )
@@ -315,14 +337,14 @@ impl HandlerContext {
     }
 
     /// Override the deadline for a reverse RPC call.
-    pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
+    pub async fn request_with_timeout<P: RpcParams + Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
-        args: A,
+        params: P,
         timeout: Duration,
     ) -> Result<R, Error> {
         self.peer
-            .request_timed(method, args, timeout, Some(&self.active))
+            .request_timed(method, params, timeout, Some(&self.active))
             .await
     }
 }

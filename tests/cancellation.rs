@@ -15,8 +15,12 @@ async fn invalid_arguments_release_pending_capacity_without_reusing_the_id() {
             })
             .start(stream)
             .unwrap();
+        // Passes the compile-time params contract but serializes a bare scalar.
+        #[derive(serde::Serialize)]
+        struct ScalarParams(u32);
+        impl msgpack_rpc_peer::RpcParams for ScalarParams {}
         assert_eq!(
-            peer.request::<_, ()>("x", 7).await,
+            peer.request::<_, ()>("x", ScalarParams(7)).await,
             Err(Error::InvalidParams)
         );
         let (result, ()) = tokio::join!(peer.request::<_, u32>("x", ()), async {

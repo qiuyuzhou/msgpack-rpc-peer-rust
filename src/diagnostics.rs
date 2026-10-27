@@ -18,7 +18,7 @@ pub const DIAGNOSTIC_EVENT_CAPACITY: usize = 64;
 pub enum DiagnosticEvent {
     /// A request or notification handler panicked under unwinding.
     HandlerPanicked,
-    /// A notification handler returned an error or could not decode its arguments.
+    /// A notification handler returned an error or could not decode its params.
     NotificationFailed,
     /// A notification was dropped because the shared handler budget was exhausted.
     NotificationDropped,

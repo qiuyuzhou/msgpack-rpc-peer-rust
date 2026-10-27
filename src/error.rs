@@ -2,7 +2,7 @@ use crate::Value;
 
 /// Local failures. Terminal causes are cloned into every outstanding request.
 ///
-/// Valid unknown methods and invalid typed arguments produce remote failures
+/// Valid unknown methods and invalid typed params produce remote failures
 /// and leave the connection usable, and so does [`Error::Timeout`].
 /// [`Error::Remote`] preserves an arbitrary non-nil remote failure without
 /// assuming a schema. Malformed envelopes, duplicate active incoming IDs,
@@ -31,7 +31,7 @@ pub enum Error {
     /// A typed value could not be encoded.
     #[error("MessagePack serialization failed: {0}")]
     Encode(String),
-    /// Arguments must be an array and must match the method's declared type.
+    /// Params must be an array and must match the method's declared type.
     #[error("invalid parameters")]
     InvalidParams,
     /// A successful remote result did not match the requested Rust type.
@@ -65,7 +65,7 @@ pub enum Error {
 /// | Code | Message | Trigger |
 /// | --- | --- | --- |
 /// | -32601 | `unknown method` | No registered request method |
-/// | -32602 | `invalid parameters` | Typed argument decoding failed |
+/// | -32602 | `invalid parameters` | Typed params decoding failed |
 /// | -32603 | `handler failed` | Request handler panic under unwinding |
 /// | -32603 | `result serialization failed` | Result encoding or conversion failed |
 /// | -32603 | `response serialization failed` | Complete response needed a fallback |

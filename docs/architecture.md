@@ -10,11 +10,11 @@ Both endpoints have identical request, response, and notification capabilities. 
 
 A builder accepts configuration and typed request and notification handlers before startup. Startup on the caller's Tokio runtime returns a cloneable `RpcPeer` handle and a separate connection owner. The connection owner supervises execution and provides graceful shutdown, immediate termination, and observable completion; dropping it initiates cancellation. Registration is immutable after startup.
 
-Calls and notifications accept explicit tuple or sequence argument lists; handlers decode the corresponding list. Empty arguments use `()`, one structured argument uses `(argument,)`, and structured arguments use named fields. Handler context exposes outgoing RPC operations, including reverse calls during draining. Ordinary peer handles reject new application calls once draining begins. The implementation must keep these two admission paths explicit.
+Calls and notifications accept explicit tuple or sequence params, constrained at compile time by the `RpcParams` trait; handlers decode the corresponding list. Empty params use `()`, one structured value uses `(value,)`, and structured values use named fields. Handler context exposes outgoing RPC operations, including reverse calls during draining. Ordinary peer handles reject new application calls once draining begins. The implementation must keep these two admission paths explicit.
 
 Generic `AsyncRead + AsyncWrite + Unpin + Send + 'static` streams are accepted directly. A small adapter pairs separate read and write halves for subprocess stdio. Unix sockets require no special RPC implementation. The library creates no runtime and owns no child process.
 
-A private typed conversion module owns argument-list encoding and decoding, result encoding and decoding, and their error mappings. List adapters remain internal to that module; bounded byte encoding, message validation and response-envelope fallback remain separate.
+A private typed conversion module owns params-list encoding and decoding, result encoding and decoding, and their error mappings. List adapters remain internal to that module; bounded byte encoding, message validation and response-envelope fallback remain separate.
 
 ## Execution and ownership
 

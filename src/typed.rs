@@ -6,20 +6,20 @@ use serde::{
 
 use crate::{Config, Error as RpcError, RemoteError, Value, wire};
 
-pub(crate) fn encode_args<A: Serialize>(args: A, config: &Config) -> Result<Value, RpcError> {
-    let bytes = wire::encode(&Arguments(args), config.max_outgoing_bytes)
+pub(crate) fn encode_params<P: Serialize>(params: P, config: &Config) -> Result<Value, RpcError> {
+    let bytes = wire::encode(&Params(params), config.max_outgoing_bytes)
         .map_err(|_| RpcError::InvalidParams)?;
     wire::value(bytes, config).map_err(|_| RpcError::InvalidParams)
 }
 
-pub(crate) fn decode_args<A: DeserializeOwned>(
+pub(crate) fn decode_params<P: DeserializeOwned>(
     params: Value,
     limit: usize,
-) -> Result<A, RemoteError> {
+) -> Result<P, RemoteError> {
     let bytes = wire::encode(&params, limit)
         .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
     let mut decoder = rmp_serde::Deserializer::from_read_ref(bytes.as_slice());
-    A::deserialize(ListDeserializer(&mut decoder))
+    P::deserialize(ListDeserializer(&mut decoder))
         .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))
 }
 
@@ -41,10 +41,10 @@ pub(crate) fn decode_result<R: DeserializeOwned>(
     rmp_serde::from_slice(&bytes).map_err(|_| RpcError::InvalidResult)
 }
 
-/// Adapts only the outer argument list; the underlying serializer handles values.
-struct Arguments<T>(T);
+/// Adapts only the outer params list; the underlying serializer handles values.
+struct Params<T>(T);
 
-impl<T: Serialize> Serialize for Arguments<T> {
+impl<T: Serialize> Serialize for Params<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(ListSerializer(serializer))
     }
@@ -52,19 +52,19 @@ impl<T: Serialize> Serialize for Arguments<T> {
 
 struct ListSerializer<S>(S);
 
-/// Enforce the same outer list contract when decoding handler arguments.
+/// Enforce the same outer list contract when decoding handler params.
 struct ListDeserializer<D>(D);
 
 struct EmptyList;
 impl<'de> serde::de::Visitor<'de> for EmptyList {
     type Value = ();
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("an empty argument list")
+        formatter.write_str("an empty params list")
     }
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
         if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
             Err(serde::de::Error::custom(
-                "unit arguments require an empty array",
+                "unit params require an empty array",
             ))
         } else {
             Ok(())
@@ -127,7 +127,7 @@ impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for ListDeserial
         _visitor: V,
     ) -> Result<V::Value, Self::Error> {
         Err(serde::de::Error::custom(
-            "wrap a struct in a one-element argument tuple",
+            "wrap a struct in a one-element params tuple",
         ))
     }
 
@@ -251,7 +251,7 @@ impl<S: Serializer> Serializer for ListSerializer<S> {
         _len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
         Err(S::Error::custom(
-            "wrap a struct in a one-element argument tuple",
+            "wrap a struct in a one-element params tuple",
         ))
     }
     fn serialize_struct_variant(
