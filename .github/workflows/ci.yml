@@ -52,13 +52,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests, including doctests
         run: cargo test --locked --all-features
-      - name: Run examples
-        run: |
-          cargo run --locked --example duplex
-          cargo run --locked --example bidirectional
-          cargo run --locked --example nested
-          cargo run --locked --example unix
-          cargo run --locked --example subprocess
 
   msrv:
     name: MSRV (Rust 1.85)

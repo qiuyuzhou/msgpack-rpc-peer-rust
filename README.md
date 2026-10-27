@@ -260,11 +260,11 @@ examples. There are no crate-specific optional features.
 
 The [GitHub Actions CI workflow](.github/workflows/ci.yml) runs on pushes, pull
 requests, and manual dispatch. It checks formatting, Clippy, and documentation on
-stable Rust, runs tests (including doctests) and all examples on Linux and macOS,
+stable Rust, runs tests (including doctests) on Linux and macOS,
 and checks all targets with Rust 1.85 on Linux. Cargo commands use `--locked` to
 validate the committed dependency versions.
 
-Run the same stable checks locally:
+Run the stable checks and examples locally:
 
 ```sh
 cargo fmt --check
