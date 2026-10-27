@@ -88,14 +88,15 @@ where
         Box::pin(async move {
             let args = A::deserialize(crate::arguments::ListDeserializer(params))
                 .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
-            encode_result(handler(context, args).await?)
+            let config = context.config().clone();
+            encode_result(handler(context, args).await?, &config)
         })
     })
 }
 
-fn encode_result<R: Serialize>(result: R) -> Result<Value, RemoteError> {
-    let bytes = wire::encode(&result)
+fn encode_result<R: Serialize>(result: R, config: &crate::Config) -> Result<Value, RemoteError> {
+    let bytes = wire::encode(&result, config.max_outgoing_bytes)
         .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))?;
-    rmpv::decode::read_value(&mut bytes.as_slice())
+    wire::value(bytes, config)
         .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))
 }

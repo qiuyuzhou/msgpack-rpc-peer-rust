@@ -6,7 +6,8 @@ connection. The library creates no runtime and establishes no transport.
 
 This initial implementation supports concurrent typed requests, notifications,
 nested reverse calls, and immediate connection termination.
-It is not yet suitable for untrusted streams. See the limitations below.
+Encoded bytes, decoded nodes, and nesting are bounded before incoming values are allocated.
+See the resource limits and remaining lifecycle limitations below.
 
 ## Installation
 
@@ -132,11 +133,28 @@ notifications are dropped. Unknown notifications and notifications with invalid
 typed arguments are ignored. A full response queue terminates the connection.
 Nested calls can therefore fail under saturation.
 
-Read buffering and encoded output have a 1 MiB byte limit. Encoding enforces the
-limit as bytes are written, including complete envelopes. Incoming decoding has
-a depth limit of 64. **Decoded container/node allocation is not hardened yet**:
-these are not total memory bounds or hostile-input guarantees. Custom Serde code
-and application handlers also control their own CPU and allocations.
+`PeerBuilder::config(Config { ..Config::default() })` sets wire limits. Defaults
+are 1 MiB per incoming object and complete outgoing envelope, 64 nested containers
+(including the envelope), and 65,536 decoded value nodes (including map keys and
+envelope fields). Limits must be positive; supported depth is at most 1024 to bound
+recursive value decoding. Startup returns `Error::InvalidConfig` for invalid limits.
+
+The incremental scanner checks MessagePack headers before allocating decoded
+containers, rejecting hostile advertised string, binary, extension, array, and map
+lengths against byte and node budgets. Stream fragmentation and consecutive objects
+need no delimiter or length prefix. Read buffering never exceeds the configured
+incoming byte length. Decoded values have count and nesting bounds; these are not
+a bound on allocator overhead or application memory.
+
+Encoding enforces the outgoing byte limit as bytes are written, including methods
+and error values. Argument/result conversion also checks depth and node budgets
+before creating dynamic values; the final outgoing envelope is byte bounded.
+Rejected calls and notifications send no partial frame. Oversized or unserializable
+results produce a generic remote failure; oversized error envelopes fall back to
+that failure. If even the generic response cannot fit, the connection terminates
+with `Error::Encode`, rather than leaving the remote request waiting indefinitely.
+Custom Serde code and application handlers control their own CPU and allocations;
+asynchronous deadlines cannot preempt synchronous application code.
 
 Dropping a request future removes its pending entry. Already queued or started
 writes can still reach the remote peer; cancellation does not prevent remote side
@@ -144,7 +162,7 @@ effects. Unmatched responses are ignored. No whole-call timeout exists yet: use
 `tokio::time::timeout` at the application boundary when needed. A started write
 continues independently of call cancellation while the connection remains active.
 
-Configurable byte/node/capacity limits, hostile-input hardening,
+Configurable work capacity limits,
 comprehensive saturation and cancellation guarantees, diagnostics, graceful
 draining, separate read/write adapters, and Unix/subprocess examples remain for
 later implementation slices. There is no reconnect, retry, process ownership, or

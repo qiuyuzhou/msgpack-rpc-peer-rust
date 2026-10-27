@@ -212,3 +212,77 @@ async fn invalid_capacity_configuration_is_rejected_at_startup() {
         Err(Error::InvalidConfig(_))
     ));
 }
+
+#[tokio::test]
+async fn both_ready_queues_alternate_while_the_remote_resumes_reading() {
+    use std::sync::{Arc, Mutex};
+    use tokio::{io::AsyncWriteExt, sync::oneshot};
+    timeout(Duration::from_secs(3), async {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let ready = Arc::new(Mutex::new(Some(ready_tx)));
+        let (stream, mut raw) = tokio::io::duplex(1);
+        let (peer, connection) = RpcPeer::builder()
+            .config(Config {
+                application_queue_capacity: 2,
+                response_queue_capacity: 4,
+                ..Config::default()
+            })
+            .notification("ready", move |_, (): ()| {
+                let ready = ready.clone();
+                async move {
+                    ready.lock().unwrap().take().unwrap().send(()).unwrap();
+                    Ok(())
+                }
+            })
+            .unwrap()
+            .start(stream)
+            .unwrap();
+        peer.notify("n", ()).await.unwrap();
+        assert_eq!(raw.read_u8().await.unwrap(), 0x93);
+        peer.notify("n", ()).await.unwrap();
+        peer.notify("n", ()).await.unwrap();
+        raw.write_all(b"\x94\x00\x00\xa1x\x90\x94\x00\x01\xa1x\x90\x93\x02\xa5ready\x90")
+            .await
+            .unwrap();
+        ready_rx.await.unwrap();
+        let mut rest = [0; 4];
+        raw.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"\x02\xa1n\x90");
+        let mut kinds = Vec::new();
+        for _ in 0..4 {
+            kinds.push(
+                read_value(&mut raw).await.as_array().unwrap()[0]
+                    .as_u64()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(kinds, [1, 2, 1, 2]);
+        connection.terminate();
+        connection.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_timeout_outside_the_clock_range_is_an_error() {
+    let (stream, _raw) = tokio::io::duplex(64);
+    let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
+    assert!(matches!(
+        peer.request_with_timeout::<_, ()>("x", (), Duration::MAX)
+            .await,
+        Err(Error::InvalidConfig(_))
+    ));
+    connection.terminate();
+    connection.wait().await.unwrap();
+    let (stream, _raw) = tokio::io::duplex(64);
+    assert!(matches!(
+        RpcPeer::builder()
+            .config(Config {
+                default_call_timeout: Duration::MAX,
+                ..Config::default()
+            })
+            .start(stream),
+        Err(Error::InvalidConfig(_))
+    ));
+}

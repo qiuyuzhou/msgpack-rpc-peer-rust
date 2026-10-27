@@ -1,11 +1,9 @@
-use std::io::{Cursor, ErrorKind};
+use std::io::Cursor;
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Error, Value};
-
-pub(crate) const MAX_BYTES: usize = 1024 * 1024;
 
 pub(crate) enum Message {
     Notification {
@@ -85,55 +83,159 @@ fn parse(value: Value) -> Result<Message, Error> {
     }
 }
 
-// The persistent buffer makes read cancellation safe when another supervisor branch wins.
-pub(crate) async fn read<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    buffer: &mut Vec<u8>,
-) -> Result<Message, Error> {
-    loop {
-        if !buffer.is_empty() {
-            let mut cursor = Cursor::new(buffer.as_slice());
-            match rmpv::decode::read_value_with_max_depth(&mut cursor, 64) {
-                Ok(value) => {
-                    let used = cursor.position() as usize;
-                    buffer.drain(..used);
-                    return parse(value);
+/// Scan boundaries and budgets before rmpv can allocate decoded containers.
+#[derive(Default)]
+pub(crate) struct Decoder {
+    buffer: Vec<u8>,
+    offset: usize,
+    remaining: Vec<usize>,
+    nodes: usize,
+}
+
+impl Decoder {
+    fn boundary(&mut self, config: &crate::Config) -> Result<Option<usize>, Error> {
+        if self.remaining.is_empty() {
+            self.remaining.push(1);
+        }
+        while self.offset < self.buffer.len() {
+            let bytes = &self.buffer[self.offset..];
+            let marker = bytes[0];
+            let (header, payload, children) = match marker {
+                0x00..=0x7f | 0xc0 | 0xc2..=0xc3 | 0xe0..=0xff => (1, 0, 0),
+                0x80..=0x8f => (1, 0, usize::from(marker & 15) * 2),
+                0x90..=0x9f => (1, 0, usize::from(marker & 15)),
+                0xa0..=0xbf => (1, usize::from(marker & 31), 0),
+                0xc1 => return Err(Error::Decode("reserved MessagePack marker".into())),
+                0xc4..=0xc9 | 0xd9..=0xdf => {
+                    let width = match marker {
+                        0xc4 | 0xc7 | 0xd9 => 1,
+                        0xc5 | 0xc8 | 0xda | 0xdc | 0xde => 2,
+                        _ => 4,
+                    };
+                    if bytes.len() < 1 + width {
+                        return Ok(None);
+                    }
+                    let length = bytes[1..1 + width]
+                        .iter()
+                        .fold(0usize, |n, b| (n << 8) | usize::from(*b));
+                    match marker {
+                        0xdc | 0xdd => (1 + width, 0, length),
+                        0xde | 0xdf => (
+                            1 + width,
+                            0,
+                            length
+                                .checked_mul(2)
+                                .ok_or(Error::ResourceLimit("decoded value nodes"))?,
+                        ),
+                        0xc7..=0xc9 => (
+                            1 + width,
+                            length
+                                .checked_add(1)
+                                .ok_or(Error::ResourceLimit("incoming message bytes"))?,
+                            0,
+                        ),
+                        _ => (1 + width, length, 0),
+                    }
                 }
-                Err(
-                    rmpv::decode::Error::InvalidMarkerRead(ref e)
-                    | rmpv::decode::Error::InvalidDataRead(ref e),
-                ) if e.kind() == ErrorKind::UnexpectedEof => {}
-                Err(e) => return Err(Error::Decode(e.to_string())),
+                0xca | 0xce | 0xd2 => (1, 4, 0),
+                0xcb | 0xcf | 0xd3 => (1, 8, 0),
+                0xcc | 0xd0 => (1, 1, 0),
+                0xcd | 0xd1 => (1, 2, 0),
+                0xd4 => (1, 2, 0),
+                0xd5 => (1, 3, 0),
+                0xd6 => (1, 5, 0),
+                0xd7 => (1, 9, 0),
+                0xd8 => (1, 17, 0),
+            };
+            let end = self
+                .offset
+                .checked_add(header)
+                .and_then(|n| n.checked_add(payload))
+                .ok_or(Error::ResourceLimit("incoming message bytes"))?;
+            if end > config.max_incoming_bytes {
+                return Err(Error::ResourceLimit("incoming message bytes"));
+            }
+            let outstanding: usize = self.remaining.iter().sum();
+            if self.nodes >= config.max_nodes
+                || children > config.max_nodes - self.nodes - outstanding
+            {
+                return Err(Error::ResourceLimit("decoded value nodes"));
+            }
+            let container = (0x80..=0x9f).contains(&marker) || (0xdc..=0xdf).contains(&marker);
+            if container && self.remaining.len() > config.max_depth {
+                return Err(Error::ResourceLimit("MessagePack nesting depth"));
+            }
+            if end > self.buffer.len() {
+                return Ok(None);
+            }
+            self.offset = end;
+            self.nodes += 1;
+            *self.remaining.last_mut().unwrap() -= 1;
+            if children != 0 {
+                self.remaining.push(children);
+            }
+            while self.remaining.last() == Some(&0) {
+                self.remaining.pop();
+            }
+            if self.remaining.is_empty() {
+                return Ok(Some(end));
             }
         }
-        if buffer.len() >= MAX_BYTES {
+        Ok(None)
+    }
+}
+
+// Decoder state survives cancellation when another supervisor branch wins.
+pub(crate) async fn read<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    decoder: &mut Decoder,
+    config: &crate::Config,
+) -> Result<Message, Error> {
+    loop {
+        if let Some(used) = decoder.boundary(config)? {
+            let value = rmpv::decode::read_value_with_max_depth(
+                &mut Cursor::new(&decoder.buffer[..used]),
+                config.max_depth + 1,
+            )
+            .map_err(|e| Error::Decode(e.to_string()))?;
+            decoder.buffer.drain(..used);
+            decoder.offset = 0;
+            decoder.nodes = 0;
+            return parse(value);
+        }
+        if decoder.buffer.len() >= config.max_incoming_bytes {
             return Err(Error::ResourceLimit("incoming message bytes"));
         }
         let mut chunk = [0; 4096];
-        let capacity = chunk.len().min(MAX_BYTES - buffer.len());
+        let capacity = chunk
+            .len()
+            .min(config.max_incoming_bytes - decoder.buffer.len());
         let n = reader
             .read(&mut chunk[..capacity])
             .await
             .map_err(|e| Error::Transport(e.to_string()))?;
         if n == 0 {
-            return Err(if buffer.is_empty() {
+            return Err(if decoder.buffer.is_empty() {
                 Error::Closed
             } else {
                 Error::Decode("truncated message at EOF".into())
             });
         }
-        buffer.extend_from_slice(&chunk[..n]);
+        decoder.buffer.extend_from_slice(&chunk[..n]);
     }
 }
 
-struct LimitedBuffer(Vec<u8>);
+struct LimitedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
 
 impl std::io::Write for LimitedBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_BYTES - self.0.len() {
+        if bytes.len() > self.limit - self.bytes.len() {
             return Err(std::io::Error::other("message byte limit exceeded"));
         }
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -142,12 +244,33 @@ impl std::io::Write for LimitedBuffer {
     }
 }
 
-pub(crate) fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
-    let mut buffer = LimitedBuffer(Vec::new());
+pub(crate) fn encode<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<Vec<u8>, Error> {
+    let mut buffer = LimitedBuffer {
+        bytes: Vec::new(),
+        limit,
+    };
     value
         .serialize(&mut rmp_serde::Serializer::new(&mut buffer).with_struct_map())
-        .map_err(|e| Error::Encode(e.to_string()))?;
-    Ok(buffer.0)
+        .map_err(|_| Error::Encode("value cannot be serialized within message limit".into()))?;
+    Ok(buffer.bytes)
+}
+
+pub(crate) fn value(bytes: Vec<u8>, config: &crate::Config) -> Result<Value, Error> {
+    // Custom serializers can advertise containers without supplying their elements.
+    let mut limits = config.clone();
+    limits.max_incoming_bytes = limits.max_outgoing_bytes;
+    let mut decoder = Decoder {
+        buffer: bytes,
+        ..Decoder::default()
+    };
+    let Some(used) = decoder.boundary(&limits)? else {
+        return Err(Error::Encode("incomplete serialized value".into()));
+    };
+    if used != decoder.buffer.len() {
+        return Err(Error::Encode("multiple serialized values".into()));
+    }
+    rmpv::decode::read_value_with_max_depth(&mut decoder.buffer.as_slice(), config.max_depth + 1)
+        .map_err(|_| Error::Encode("invalid serialized value".into()))
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
@@ -157,10 +280,11 @@ pub(crate) fn decode<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
 pub(crate) fn response(
     id: u32,
     outcome: Result<Value, crate::RemoteError>,
+    limit: usize,
 ) -> Result<Vec<u8>, Error> {
     let (error, result) = match outcome {
         Ok(result) => (Value::Nil, result),
         Err(error) => (error.into_value(), Value::Nil),
     };
-    encode(&(1u8, id, error, result))
+    encode(&(1u8, id, error, result), limit)
 }
