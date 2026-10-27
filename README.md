@@ -17,8 +17,7 @@ tokio = { version = "1.53", features = ["rt", "macros", "io-util"] }
 
 The declared MSRV is Rust 1.85: edition 2024 and the selected `rmp`, `rmp-serde`,
 `rmpv`, and Tokio versions require it. The locked dependency metadata declares no
-higher minimum. Validation used Rust 1.98.1 on macOS; all targets also passed
-`cargo check --locked --all-targets --all-features` with Rust 1.85.0 on macOS.
+higher minimum.
 
 ## Basic usage
 
