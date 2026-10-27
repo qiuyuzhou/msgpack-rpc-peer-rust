@@ -149,3 +149,129 @@ async fn arbitrary_remote_error_values_are_preserved() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn notifications_match_literal_fixtures_in_both_directions() {
+    timeout(Duration::from_secs(3), async {
+        let (received, mut events) = tokio::sync::mpsc::channel(2);
+        let (stream, mut raw) = tokio::io::duplex(128);
+        let (peer, connection) = RpcPeer::builder()
+            .notification("event", move |_, (n,): (u32,)| {
+                let received = received.clone();
+                async move {
+                    received.send(n).await.unwrap();
+                    Ok(())
+                }
+            })
+            .unwrap()
+            .start(stream)
+            .unwrap();
+        peer.notify("event", (Person { name: "Ada" },))
+            .await
+            .unwrap();
+        let expected = b"\x93\x02\xa5event\x91\x81\xa4name\xa3Ada";
+        let mut actual = vec![0; expected.len()];
+        raw.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+        peer.notify("empty", ()).await.unwrap();
+        let mut empty = [0; 9];
+        raw.read_exact(&mut empty).await.unwrap();
+        assert_eq!(&empty, b"\x93\x02\xa5empty\x90");
+        // Fragmented notification followed by another object in the same stream.
+        raw.write_all(b"\x93\x02\xa5ev").await.unwrap();
+        raw.write_all(b"ent\x91\x2a\x93\x02\xa5event\x91\x07")
+            .await
+            .unwrap();
+        let mut received = [events.recv().await.unwrap(), events.recv().await.unwrap()];
+        received.sort();
+        assert_eq!(received, [7, 42]);
+        connection.terminate();
+        connection.wait().await.unwrap();
+        let mut remaining = Vec::new();
+        raw.read_to_end(&mut remaining).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "notifications must not generate responses"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn malformed_notification_envelopes_close_the_connection() {
+    timeout(Duration::from_secs(3), async {
+        for (frame, reason) in [
+            (
+                b"\x92\x02\xa1x".as_slice(),
+                "notification must have three fields",
+            ),
+            (
+                b"\x94\x02\xa1x\x90\xc0".as_slice(),
+                "notification must have three fields",
+            ),
+            (b"\x93\x02\x00\x90".as_slice(), "method must be a string"),
+            (b"\x93\x02\xa1x\xc0".as_slice(), "params must be an array"),
+        ] {
+            let (stream, mut raw) = tokio::io::duplex(128);
+            let (_peer, connection) = RpcPeer::builder().start(stream).unwrap();
+            raw.write_all(frame).await.unwrap();
+            assert_eq!(connection.wait().await, Err(Error::Protocol(reason)));
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn notification_failures_never_reply_or_close_the_connection() {
+    timeout(Duration::from_secs(3), async {
+        let (invoked, mut calls) = tokio::sync::mpsc::channel(2);
+        let panicked = invoked.clone();
+        let (stream, mut raw) = tokio::io::duplex(128);
+        let (_peer, connection) = RpcPeer::builder()
+            .notification("err", move |_, (): ()| {
+                let invoked = invoked.clone();
+                async move {
+                    invoked.send(()).await.unwrap();
+                    Err(msgpack_rpc_peer::RemoteError::new("private error".into()).unwrap())
+                }
+            })
+            .unwrap()
+            .notification("panic", move |_, (): ()| {
+                let panicked = panicked.clone();
+                async move {
+                    panicked.send(()).await.unwrap();
+                    panic!("private notification panic");
+                }
+            })
+            .unwrap()
+            .method("ok", |_, (): ()| async { Ok(42u32) })
+            .unwrap()
+            .start(stream)
+            .unwrap();
+        raw.write_all(b"\x93\x02\xa3err\x90\x93\x02\xa5panic\x90")
+            .await
+            .unwrap();
+        calls.recv().await.unwrap();
+        calls.recv().await.unwrap();
+        // Unknown names and invalid typed arguments are also one-way failures.
+        raw.write_all(b"\x93\x02\xa1x\x90\x93\x02\xa3err\x91\x01\x94\x00\x00\xa2ok\x90")
+            .await
+            .unwrap();
+        let mut response = [0; 5];
+        raw.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"\x94\x01\x00\xc0\x2a");
+        connection.terminate();
+        connection.wait().await.unwrap();
+        let mut remaining = Vec::new();
+        raw.read_to_end(&mut remaining).await.unwrap();
+        assert!(remaining.is_empty());
+        assert!(
+            calls.recv().await.is_none(),
+            "invalid arguments must not invoke the handler"
+        );
+    })
+    .await
+    .unwrap();
+}

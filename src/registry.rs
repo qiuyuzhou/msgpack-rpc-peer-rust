@@ -12,6 +12,7 @@ pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + S
 #[derive(Default)]
 pub struct PeerBuilder {
     pub(crate) methods: HashMap<String, Handler>,
+    pub(crate) notifications: HashMap<String, Handler>,
 }
 
 impl PeerBuilder {
@@ -32,18 +33,28 @@ impl PeerBuilder {
         if self.methods.contains_key(&name) {
             return Err(Error::DuplicateMethod);
         }
-        let handler = Arc::new(handler);
-        self.methods.insert(
-            name,
-            Arc::new(move |context, params| {
-                let handler = handler.clone();
-                Box::pin(async move {
-                    let args = A::deserialize(crate::arguments::ListDeserializer(params))
-                        .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
-                    encode_result(handler(context, args).await?)
-                })
-            }),
-        );
+        self.methods.insert(name, typed_handler(handler));
+        Ok(self)
+    }
+
+    /// Register a typed asynchronous notification handler returning `Result<(), RemoteError>`.
+    /// Notification names are independent of request method names; duplicates are rejected.
+    /// Handlers execute concurrently, without completion-order or delivery guarantees.
+    pub fn notification<A, F, Fut>(
+        mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) -> Result<Self, Error>
+    where
+        A: DeserializeOwned + Send + 'static,
+        F: Fn(HandlerContext, A) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), RemoteError>> + Send + 'static,
+    {
+        let name = name.into();
+        if self.notifications.contains_key(&name) {
+            return Err(Error::DuplicateMethod);
+        }
+        self.notifications.insert(name, typed_handler(handler));
         Ok(self)
     }
 
@@ -55,6 +66,24 @@ impl PeerBuilder {
     {
         crate::peer::start(self, stream)
     }
+}
+
+fn typed_handler<A, R, F, Fut>(handler: F) -> Handler
+where
+    A: DeserializeOwned + Send + 'static,
+    R: Serialize + Send + 'static,
+    F: Fn(HandlerContext, A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<R, RemoteError>> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    Arc::new(move |context, params| {
+        let handler = handler.clone();
+        Box::pin(async move {
+            let args = A::deserialize(crate::arguments::ListDeserializer(params))
+                .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
+            encode_result(handler(context, args).await?)
+        })
+    })
 }
 
 fn encode_result<R: Serialize>(result: R) -> Result<Value, RemoteError> {

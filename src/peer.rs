@@ -73,6 +73,24 @@ impl RpcPeer {
         PeerBuilder::default()
     }
 
+    /// Queue a one-way notification with an explicit argument list.
+    /// Success means queued locally, without acknowledgment of delivery or execution.
+    /// Waits for bounded outgoing capacity; consumes no request ID or pending-call slot.
+    pub async fn notify<A: Serialize>(&self, method: &str, args: A) -> Result<(), Error> {
+        if let Some(error) = &self.shared.state.lock().unwrap().terminal {
+            return Err(error.clone());
+        }
+        let args = wire::encode(&Arguments(args)).map_err(|_| Error::InvalidParams)?;
+        let params =
+            rmpv::decode::read_value(&mut args.as_slice()).map_err(|_| Error::InvalidParams)?;
+        let frame = wire::encode(&(2u8, method, params))?;
+        self.shared
+            .outgoing
+            .send(frame)
+            .await
+            .map_err(|_| self.shared.terminal())
+    }
+
     /// Send an explicit argument list and decode a typed result.
     /// Use `()` for no arguments and `(value,)` for one argument.
     /// Calls wait for bounded capacity; dropping the future releases its pending entry.
@@ -124,6 +142,11 @@ pub struct HandlerContext {
 }
 
 impl HandlerContext {
+    /// Queue a notification while incoming messages continue to be processed.
+    pub async fn notify<A: Serialize>(&self, method: &str, args: A) -> Result<(), Error> {
+        self.peer.notify(method, args).await
+    }
+
     /// Issue a request while the connection continues processing responses.
     pub async fn request<A: Serialize, R: DeserializeOwned>(
         &self,
@@ -237,7 +260,7 @@ where
     let (mut reader, write_half) = tokio::io::split(stream);
     let (responses, mut response_rx) = mpsc::channel(CAPACITY);
     let mut handlers = JoinSet::new();
-    let mut active: HashMap<Id, u32> = HashMap::new();
+    let mut active: HashMap<Id, Option<u32>> = HashMap::new();
     let mut buffer = Vec::new();
     let terminal = {
         let writing = writer(write_half, &mut application, &mut response_rx);
@@ -251,8 +274,9 @@ where
                         Ok((task_id, outcome)) => (task_id, outcome),
                         Err(error) => (error.id(), Err(RemoteError::builtin(-32603, "handler failed"))),
                     };
-                    let id = active.remove(&task_id).unwrap();
-                    if let Err(error) = respond(&responses, id, outcome) { break error; }
+                    if let Some(id) = active.remove(&task_id).unwrap() {
+                        if let Err(error) = respond(&responses, id, outcome) { break error; }
+                    }
                 }
                 message = wire::read(&mut reader, &mut buffer) => {
                     match message {
@@ -261,7 +285,7 @@ where
                             if let Some(reply) = peer.shared.state.lock().unwrap().pending.remove(&id) { let _ = reply.send(outcome); }
                         }
                         Ok(Message::Request { id, method, params }) => {
-                            if active.values().any(|active_id| *active_id == id) { break Error::Protocol("duplicate active request ID"); }
+                            if active.values().any(|active_id| *active_id == Some(id)) { break Error::Protocol("duplicate active request ID"); }
                             let Some(handler) = builder.methods.get(&method).cloned() else {
                                 if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method"))) { break error; }
                                 continue;
@@ -272,7 +296,15 @@ where
                             }
                             let context = HandlerContext { peer: peer.clone() };
                             let task = handlers.spawn(async move { handler(context, params).await });
-                            active.insert(task.id(), id);
+                            active.insert(task.id(), Some(id));
+                        }
+                        Ok(Message::Notification { method, params }) => {
+                            if handlers.len() >= CAPACITY { continue; }
+                            if let Some(handler) = builder.notifications.get(&method).cloned() {
+                                let context = HandlerContext { peer: peer.clone() };
+                                let task = handlers.spawn(async move { handler(context, params).await });
+                                active.insert(task.id(), None);
+                            }
                         }
                     }
                 }

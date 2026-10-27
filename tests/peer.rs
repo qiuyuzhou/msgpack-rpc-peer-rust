@@ -160,3 +160,29 @@ async fn handlers_require_explicit_argument_lists() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn notification_registration_and_arguments_are_validated() {
+    assert!(matches!(
+        RpcPeer::builder()
+            .notification("event", |_, (): ()| async { Ok(()) })
+            .unwrap()
+            .notification("event", |_, (): ()| async { Ok(()) }),
+        Err(Error::DuplicateMethod)
+    ));
+    let (stream, _raw) = tokio::io::duplex(128);
+    let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
+    assert_eq!(peer.notify("event", 7).await, Err(Error::InvalidParams));
+    assert_eq!(
+        peer.notify("event", None::<u32>).await,
+        Err(Error::InvalidParams)
+    );
+    assert_eq!(
+        peer.notify("event", std::collections::BTreeMap::from([("n", 7)]))
+            .await,
+        Err(Error::InvalidParams)
+    );
+    connection.terminate();
+    connection.wait().await.unwrap();
+    assert_eq!(peer.notify("event", ()).await, Err(Error::Closed));
+}

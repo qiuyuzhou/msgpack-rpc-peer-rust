@@ -8,6 +8,10 @@ use crate::{Error, Value};
 pub(crate) const MAX_BYTES: usize = 1024 * 1024;
 
 pub(crate) enum Message {
+    Notification {
+        method: String,
+        params: Value,
+    },
     Request {
         id: u32,
         method: String,
@@ -30,6 +34,21 @@ fn parse(value: Value) -> Result<Message, Error> {
     let Value::Array(mut fields) = value else {
         return Err(Error::Protocol("message must be an array"));
     };
+    if fields.first().and_then(Value::as_u64) == Some(2) {
+        if fields.len() != 3 {
+            return Err(Error::Protocol("notification must have three fields"));
+        }
+        let params = fields.pop().unwrap();
+        let method = fields.pop().unwrap();
+        let method = method
+            .as_str()
+            .ok_or(Error::Protocol("method must be a string"))?
+            .to_owned();
+        if !params.is_array() {
+            return Err(Error::Protocol("params must be an array"));
+        }
+        return Ok(Message::Notification { method, params });
+    }
     if fields.len() != 4 {
         return Err(Error::Protocol("request or response must have four fields"));
     }
