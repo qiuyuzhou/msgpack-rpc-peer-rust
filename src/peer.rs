@@ -77,6 +77,29 @@ impl Shared {
         }
     }
 
+    fn commit(
+        self: &Arc<Self>,
+        permit: mpsc::Permit<'_, Outgoing>,
+        bytes: Vec<u8>,
+        request_id: Option<u32>,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(error) = &state.terminal {
+            return Err(error.clone());
+        }
+        state.frames += 1;
+        // Receiver cleanup publishes terminal state under this lock before closing queues.
+        permit.send(Outgoing {
+            bytes,
+            request_id,
+            _frame: WorkGuard {
+                shared: self.clone(),
+                frame: true,
+            },
+        });
+        Ok(())
+    }
+
     fn terminal(&self) -> Error {
         self.state
             .lock()
@@ -184,8 +207,7 @@ impl RpcPeer {
             &(2u8, method, params),
             self.shared.config.max_outgoing_bytes,
         )?;
-        permit.send(self.shared.frame(frame, None));
-        Ok(())
+        self.shared.commit(permit, frame, None)
     }
 
     /// Send an explicit argument list and decode a typed result.
@@ -268,7 +290,7 @@ impl RpcPeer {
             &(0u8, id, method, params),
             self.shared.config.max_outgoing_bytes,
         )?;
-        permit.send(self.shared.frame(frame, Some(id)));
+        self.shared.commit(permit, frame, Some(id))?;
         let value = receiver.await.map_err(|_| self.shared.terminal())??;
         wire::decode(value)
     }
@@ -480,6 +502,15 @@ fn respond(
         .map_err(|_| Error::ResourceLimit("response queue"))
 }
 
+type HandlerCompletion = Result<(Id, Result<Value, RemoteError>), tokio::task::JoinError>;
+
+enum Event {
+    Changed,
+    Writer(Error),
+    Handler(HandlerCompletion),
+    Message(Result<Message, Error>),
+}
+
 async fn run<S>(
     stream: S,
     builder: PeerBuilder,
@@ -520,10 +551,18 @@ where
             tokio::select! { biased;
                 _ = expired => break Error::ShutdownTimeout,
                 _ = &mut canceled => break Error::Closed,
-                _ = peer.shared.changed.notified() => {},
-                error = &mut writing => break error,
-                completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
-                    let completion = completed.unwrap();
+                event = async {
+                    tokio::select! {
+                        _ = peer.shared.changed.notified() => Event::Changed,
+                        error = &mut writing => Event::Writer(error),
+                        completed = handlers.join_next_with_id(), if !handlers.is_empty() => Event::Handler(completed.unwrap()),
+                        message = wire::read(&mut reader, &mut buffer, &builder.config) => Event::Message(message),
+                    }
+                } => match event {
+                Event::Changed => {},
+                Event::Writer(error) => break error,
+                Event::Handler(completed) => {
+                    let completion = completed;
                     let panicked = completion.is_err();
                     let (task_id, outcome) = match completion {
                         Ok((task_id, outcome)) => (task_id, outcome),
@@ -540,7 +579,7 @@ where
                         if let Err(error) = respond(&responses, id, outcome, builder.config.max_outgoing_bytes, &peer.shared) { break error; }
                     }
                 }
-                message = wire::read(&mut reader, &mut buffer, &builder.config) => {
+                Event::Message(message) => {
                     match message {
                         Err(error) => break error,
                         Ok(Message::Response { id, outcome }) => {
@@ -576,6 +615,7 @@ where
                             }
                         }
                     }
+                }
                 }
             }
         };
