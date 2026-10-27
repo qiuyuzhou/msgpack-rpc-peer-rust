@@ -11,11 +11,18 @@ pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + S
 /// Register typed methods before consuming the builder to start a connection.
 #[derive(Default)]
 pub struct PeerBuilder {
+    pub(crate) config: crate::Config,
     pub(crate) methods: HashMap<String, Handler>,
     pub(crate) notifications: HashMap<String, Handler>,
 }
 
 impl PeerBuilder {
+    /// Set resource limits, validated when the connection starts.
+    pub fn config(mut self, config: crate::Config) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Register an asynchronous request handler. `A` is a tuple or sequence of arguments.
     /// Duplicate names are rejected. Handler errors retain their arbitrary wire value.
     pub fn method<A, R, F, Fut>(
@@ -81,14 +88,15 @@ where
         Box::pin(async move {
             let args = A::deserialize(crate::arguments::ListDeserializer(params))
                 .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
-            encode_result(handler(context, args).await?)
+            let config = context.config().clone();
+            encode_result(handler(context, args).await?, &config)
         })
     })
 }
 
-fn encode_result<R: Serialize>(result: R) -> Result<Value, RemoteError> {
-    let bytes = wire::encode(&result)
+fn encode_result<R: Serialize>(result: R, config: &crate::Config) -> Result<Value, RemoteError> {
+    let bytes = wire::encode(&result, config.max_outgoing_bytes)
         .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))?;
-    rmpv::decode::read_value(&mut bytes.as_slice())
+    wire::value(bytes, config)
         .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))
 }
