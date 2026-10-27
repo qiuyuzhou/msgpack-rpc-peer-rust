@@ -79,7 +79,11 @@ initiate reverse operations while the receive loop continues processing response
 Requests and notifications share a bounded concurrent handler budget and can finish
 out of arrival order. Multiple outstanding outgoing calls correlate responses by ID.
 Both endpoints have independent outgoing ID namespaces, so opposite requests with
-the same numeric ID do not collide.
+the same numeric ID do not collide. Incoming request IDs remain active from admission
+until their response has been completely written and flushed, including unknown
+method and overload responses. Repeating an ID during that interval is a fatal
+protocol violation. A remote peer may reuse an incoming ID after that response
+completes; this library's own outgoing IDs still never repeat.
 
 `request` has a 30-second whole-call deadline by default. Set
 `Config::default_call_timeout`, or use `request_with_timeout(method, args, duration)`
@@ -166,7 +170,8 @@ the connection terminates with `Error::Encode` instead of stranding a remote cal
 Queue slots are reserved before application serialization, so capacity waiters
 retain no library-encoded frame. Reserved queue slots, the single active writer,
 active handlers and their result conversions, and the reader have separate bounded
-costs. Byte buffers, value nodes, queue counts, and active-work counts do not specify
+costs. Active incoming IDs are bounded by admitted handlers, queued responses,
+and the one in-flight response. Byte buffers, value nodes, queue counts, and active-work counts do not specify
 allocator overhead or a total process-memory bound. Application-provided arguments,
 custom Serde implementations, transport implementations, and handlers remain
 responsible for their own allocations and CPU use.
