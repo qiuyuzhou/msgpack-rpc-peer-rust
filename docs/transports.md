@@ -4,8 +4,9 @@ The application establishes a transport and passes an owned Tokio `AsyncRead +
 AsyncWrite + Unpin + Send + 'static` stream to `PeerBuilder::start`. Connection
 establishment does not assign RPC roles: either endpoint can initiate requests
 and notifications on the same connection. Retain the returned connection owner
-and use `terminate` followed by `wait` for immediate cancellation and completed
-cleanup.
+and use `shutdown().await` for bounded graceful draining, or `terminate` followed
+by `wait` for immediate cancellation and completed cleanup. Graceful shutdown
+owns only RPC work; applications still choose process-exit policy.
 
 ## Unix domain sockets
 
