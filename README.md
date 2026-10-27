@@ -260,6 +260,33 @@ stable Rust, runs tests (including doctests) on Linux and macOS,
 and checks all targets with Rust 1.85 on Linux. Cargo commands use `--locked` to
 validate the committed dependency versions.
 
+### Commit checks
+
+Install [pre-commit](https://pre-commit.com/#installation),
+[actionlint](https://github.com/rhysd/actionlint#installation), and the Rust
+components, then enable the hooks for this checkout:
+
+```sh
+rustup component add rustfmt clippy
+pre-commit install
+pre-commit run --all-files
+```
+
+The [pre-commit configuration](.pre-commit-config.yaml) checks staged whitespace
+and conflict markers on every commit. Rust source or manifest changes trigger
+format checking; Rust source, dependency, toolchain, or Cargo configuration changes
+trigger Clippy with warnings denied, including checks for examples. Workflow
+changes trigger actionlint. Hooks check files without automatically fixing them.
+Tests, documentation builds, and MSRV checks remain in CI; hooks do not run examples.
+
+Use `pre-commit install` without `--overwrite` to preserve existing hooks through
+pre-commit's migration mode. During commits, pre-commit temporarily hides unstaged
+changes to tracked files; Cargo still checks the whole crate and may see untracked
+files. Manual `--all-files` runs check the current working tree; the staged-diff
+hook always checks the index.
+
+### Local verification
+
 Run the stable checks and examples locally:
 
 ```sh

@@ -1,0 +1,31 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: staged-diff
+        name: Check staged whitespace and conflict markers
+        entry: git diff --cached --check
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: rustfmt
+        name: Check Rust formatting
+        entry: cargo fmt --check
+        language: system
+        files: '(^|/)(Cargo\.toml|\.?rustfmt\.toml)$|\.rs$'
+        pass_filenames: false
+
+      - id: clippy
+        name: Check Rust with Clippy (deny warnings)
+        entry: cargo clippy --locked --all-targets --all-features -- -D warnings
+        language: system
+        files: '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?)$|\.rs$|^\.cargo/config(\.toml)?$'
+        pass_filenames: false
+
+      - id: actionlint
+        name: Check GitHub Actions workflows
+        entry: actionlint
+        language: system
+        files: '^\.github/workflows/[^/]+\.ya?ml$'
