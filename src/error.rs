@@ -3,6 +3,12 @@ use crate::Value;
 /// Local failures. Terminal causes are cloned into every outstanding request.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum Error {
+    /// New application work is refused during graceful shutdown.
+    #[error("connection is draining")]
+    Draining,
+    /// Graceful shutdown reached its fixed deadline and canceled remaining work.
+    #[error("graceful shutdown deadline expired")]
+    ShutdownTimeout,
     /// The whole-call deadline expired; remote effects may still occur.
     #[error("request timed out")]
     Timeout,

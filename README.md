@@ -238,3 +238,26 @@ terminates the connection with `Error::ResourceLimit("response queue")`. The sin
 writer alternates preference between queues so neither continuously ready queue
 starves the other. Queue lengths bound frame counts, not total process memory;
 frames, decoded values, handlers, and application allocations have separate costs.
+
+`Connection::shutdown()` atomically starts draining with the configured five-second
+`Config::graceful_shutdown_timeout`; `shutdown_with_timeout` supplies a fixed override.
+New application calls and notifications return `Error::Draining`. Operations already
+admitted, including those waiting for pending or outgoing capacity, may finish.
+Admitted handlers can make reverse calls and notifications while draining; cloned
+handler contexts lose that privilege when their handler ends. Incoming work remains
+admissible within the same limits because the wire cannot identify reverse calls.
+Traffic does not extend the deadline. Success requires all admitted operations,
+handlers, queued frames, and in-flight writes to finish. Deadline expiration returns
+`Error::ShutdownTimeout` after canceling and joining owned work; pending calls see
+the same cause. EOF still completes the owner successfully and fails outstanding
+calls with `Error::Closed`; other terminal failures preserve their cause.
+
+`terminate()` cancels immediately. `wait()` and either shutdown operation observe
+transport release and all supervised handler termination. Dropping the owner,
+including canceling its `wait` or shutdown future, initiates cancellation but cannot
+synchronously join tasks. Surviving peer handles and contexts do not keep transport
+execution alive. Queue capacity is reserved before outgoing serialization, so
+producers waiting for capacity retain no library-encoded frame. Reserved queue
+slots, the single active writer, active handlers, and bounded typed conversions
+are separate contributors to library-owned memory; application-provided arguments,
+custom serializers, and handler allocations remain application responsibilities.

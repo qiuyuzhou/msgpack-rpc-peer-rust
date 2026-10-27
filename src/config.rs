@@ -22,6 +22,8 @@ pub struct Config {
     pub response_queue_capacity: usize,
     /// Whole-call deadline, including asynchronous capacity waits.
     pub default_call_timeout: Duration,
+    /// Fixed deadline for graceful shutdown, including accepted writes and handler work.
+    pub graceful_shutdown_timeout: Duration,
 }
 
 impl Default for Config {
@@ -36,6 +38,7 @@ impl Default for Config {
             max_depth: 64,
             max_nodes: 65_536,
             default_call_timeout: Duration::from_secs(30),
+            graceful_shutdown_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -59,6 +62,10 @@ impl Config {
             || self.max_depth == 0
             || self.max_depth > 1024
             || self.max_nodes == 0
+            || self.graceful_shutdown_timeout.is_zero()
+            || std::time::Instant::now()
+                .checked_add(self.graceful_shutdown_timeout)
+                .is_none()
             || self.default_call_timeout.is_zero()
             || std::time::Instant::now()
                 .checked_add(self.default_call_timeout)
