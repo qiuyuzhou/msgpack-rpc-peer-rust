@@ -187,3 +187,32 @@ cargo run --example duplex
 cargo run --example bidirectional
 cargo run --example nested
 ```
+
+### Handler failures and diagnostics
+
+Unknown request methods return `{"code": -32601, "message": "unknown method"}`;
+invalid typed arguments return code `-32602` and message `invalid parameters`.
+Handler panics return code `-32603` and message `handler failed`. Result or response
+serialization failures also use `-32603` with `result serialization failed` or
+`response serialization failed` when the fallback response fits the configured
+limit. Overload uses `-32000`, `handler capacity exhausted`. These codes are local
+library conventions, not MessagePack-RPC standard codes. Arbitrary non-nil remote
+error values are preserved in `Error::Remote`; applications must interpret them.
+
+`peer.diagnostics()` returns fixed counters for handler panics, notification
+failures, dropped notifications and lost diagnostic events. Counters remain active
+without event observation. Enable `builder.diagnostic_events(true)` before startup,
+then call `connection.take_events()` once and await `events.recv()`. The optional
+queue holds at most 64 fixed `DiagnosticEvent` variants. A full or dropped receiver
+increments `lost_events`; disabled observation does not. Diagnostics never wait
+for event consumers or spawn extra tasks. Snapshots read each counter independently.
+The event stream closes when the connection terminates, even if peer handles survive.
+
+Under panic unwinding, request and notification handler invocation and future
+execution are isolated in supervised tasks; subsequent requests can still succeed.
+Notification errors (including invalid arguments) and panics are counted separately.
+Default library errors generated for handlers and diagnostic events contain no
+parameters, remote method names, or application panic payloads. This does not
+control application logging, arbitrary application-provided remote error values,
+or the process panic hook, which runs before a panic is caught. Panic-abort builds
+cannot recover from a handler panic.

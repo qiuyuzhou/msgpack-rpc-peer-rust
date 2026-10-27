@@ -21,3 +21,8 @@ pub use peer::{Connection, HandlerContext, RpcPeer};
 pub use registry::PeerBuilder;
 /// An arbitrary MessagePack value, including remote error payloads.
 pub use rmpv::Value;
+
+mod diagnostics;
+pub use diagnostics::{
+    DIAGNOSTIC_EVENT_CAPACITY, DiagnosticEvent, DiagnosticEvents, DiagnosticsSnapshot,
+};
