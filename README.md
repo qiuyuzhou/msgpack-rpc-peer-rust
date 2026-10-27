@@ -216,3 +216,25 @@ parameters, remote method names, or application panic payloads. This does not
 control application logging, arbitrary application-provided remote error values,
 or the process panic hook, which runs before a panic is caught. Panic-abort builds
 cannot recover from a handler panic.
+
+Calls have a 30-second whole-call timeout by default, configurable with
+`Config::default_call_timeout`. `request_with_timeout` overrides it for one call,
+including waits for pending and outgoing queue capacity. Deadlines cannot preempt
+synchronous Serde code or application handlers. Dropping, aborting, or timing out
+a call releases its pending entry; queued calls that have not started writing are
+skipped. A started frame finishes while the connection remains active, so local
+cancellation cannot prevent remote side effects. Late responses are ignored.
+Outgoing IDs increase without reuse; exhaustion returns `Error::ResourceLimit`
+rather than wrapping. `Error::Timeout` does not terminate the connection.
+
+`Config` defaults to 64 pending calls, 64 concurrent handlers shared by requests
+and notifications, and 64 frames in each application and response queue. Zero or
+unsupported capacities are rejected at startup. Application operations wait for
+queue space; incoming admission never waits for a handler or writer. Excess
+requests receive the library-defined `-32000` overload error; excess notifications
+are dropped and counted by `RpcPeer::dropped_notifications`. Arbitrarily nested
+calls can therefore fail under finite limits. A full internal response queue
+terminates the connection with `Error::ResourceLimit("response queue")`. The single
+writer alternates preference between queues so neither continuously ready queue
+starves the other. Queue lengths bound frame counts, not total process memory;
+frames, decoded values, handlers, and application allocations have separate costs.

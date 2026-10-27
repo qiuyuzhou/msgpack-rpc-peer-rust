@@ -145,3 +145,46 @@ async fn event_backlog_is_bounded_and_lost_events_are_counted() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn notification_overload_uses_the_same_counter_and_event_contract() {
+    use msgpack_rpc_peer::{Config, DiagnosticEvent};
+    use std::sync::Arc;
+    timeout(Duration::from_secs(3), async {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let (left, right) = tokio::io::duplex(4096);
+        let (caller, caller_owner) = RpcPeer::builder().start(left).unwrap();
+        let (peer, mut owner) = RpcPeer::builder()
+            .config(Config {
+                max_handlers: 1,
+                ..Config::default()
+            })
+            .diagnostic_events(true)
+            .notification("hold", move |_, (): ()| {
+                let signal = signal.clone();
+                async move {
+                    signal.notify_one();
+                    std::future::pending::<Result<(), RemoteError>>().await
+                }
+            })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        let mut events = owner.take_events().unwrap();
+        caller.notify("hold", ()).await.unwrap();
+        started.notified().await;
+        caller.notify("hold", ()).await.unwrap();
+        assert_eq!(
+            events.recv().await,
+            Some(DiagnosticEvent::NotificationDropped)
+        );
+        assert_eq!(peer.diagnostics().dropped_notifications, 1);
+        assert_eq!(peer.dropped_notifications(), 1);
+        owner.terminate();
+        owner.wait().await.unwrap();
+        caller_owner.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
