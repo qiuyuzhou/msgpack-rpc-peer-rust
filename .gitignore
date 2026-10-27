@@ -9,3 +9,6 @@
 /.beads/
 /.codex/
 /.agents/skills/beads/
+
+# Rust build artifacts
+/target/

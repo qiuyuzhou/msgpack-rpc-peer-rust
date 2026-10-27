@@ -1,0 +1,65 @@
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::{Connection, Error, HandlerContext, RemoteError, RpcPeer, Value, wire};
+
+type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send>>;
+pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + Send + Sync>;
+
+/// Register typed methods before consuming the builder to start a connection.
+#[derive(Default)]
+pub struct PeerBuilder {
+    pub(crate) methods: HashMap<String, Handler>,
+}
+
+impl PeerBuilder {
+    /// Register an asynchronous request handler. `A` is a tuple or sequence of arguments.
+    /// Duplicate names are rejected. Handler errors retain their arbitrary wire value.
+    pub fn method<A, R, F, Fut>(
+        mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) -> Result<Self, Error>
+    where
+        A: DeserializeOwned + Send + 'static,
+        R: Serialize + Send + 'static,
+        F: Fn(HandlerContext, A) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, RemoteError>> + Send + 'static,
+    {
+        let name = name.into();
+        if self.methods.contains_key(&name) {
+            return Err(Error::DuplicateMethod);
+        }
+        let handler = Arc::new(handler);
+        self.methods.insert(
+            name,
+            Arc::new(move |context, params| {
+                let handler = handler.clone();
+                Box::pin(async move {
+                    let args = A::deserialize(crate::arguments::ListDeserializer(params))
+                        .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
+                    encode_result(handler(context, args).await?)
+                })
+            }),
+        );
+        Ok(self)
+    }
+
+    /// Attach an already-established stream using the current Tokio runtime.
+    /// The returned connection owner must be retained for the connection to stay alive.
+    pub fn start<S>(self, stream: S) -> Result<(RpcPeer, Connection), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        crate::peer::start(self, stream)
+    }
+}
+
+fn encode_result<R: Serialize>(result: R) -> Result<Value, RemoteError> {
+    let bytes = wire::encode(&result)
+        .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))?;
+    rmpv::decode::read_value(&mut bytes.as_slice())
+        .map_err(|_| RemoteError::builtin(-32603, "result serialization failed"))
+}
