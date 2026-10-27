@@ -17,8 +17,9 @@ tokio = { version = "1.53", features = ["rt", "macros", "io-util"] }
 
 The declared MSRV is Rust 1.85: edition 2024 and the selected `rmp`, `rmp-serde`,
 `rmpv`, and Tokio versions require it. The locked dependency metadata declares no
-higher minimum. Validation used Rust 1.98.1 on macOS; Rust 1.85 is unavailable in
-the validation environment and remains unverified. As a compiler-policy check,
+higher minimum. Validation used Rust 1.98.1 on macOS; all targets also passed
+`cargo check --locked --all-targets --all-features` with Rust 1.85.0 on macOS.
+As a compiler-policy check,
 the inspected [shadowsocks-rust manifest](https://github.com/shadowsocks/shadowsocks-rust/blob/master/Cargo.toml)
 declares Rust 1.91, above this crate's declared minimum. This checks declared
 compatibility only; no downstream build or application integration was performed.
@@ -255,18 +256,26 @@ lifecycle dependency:
 | thiserror | Clonable local error categories |
 
 Tokio's `net`, `process`, and `io-std` features are enabled only for tests and
-examples. There are no crate-specific optional features. Reproduce validation:
+examples. There are no crate-specific optional features.
+
+The [GitHub Actions CI workflow](.github/workflows/ci.yml) runs on pushes, pull
+requests, and manual dispatch. It checks formatting, Clippy, and documentation on
+stable Rust, runs tests (including doctests) and all examples on Linux and macOS,
+and checks all targets with Rust 1.85 on Linux. Cargo commands use `--locked` to
+validate the committed dependency versions.
+
+Run the same stable checks locally:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo run --example duplex
-cargo run --example bidirectional
-cargo run --example nested
-cargo run --example unix
-cargo run --example subprocess
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo run --locked --example duplex
+cargo run --locked --example bidirectional
+cargo run --locked --example nested
+cargo run --locked --example unix
+cargo run --locked --example subprocess
 ```
 
 The Unix example runs only on Unix and reports that limitation elsewhere.
