@@ -11,6 +11,7 @@ async fn timed_out_calls_ignore_late_responses_and_never_reuse_ids() {
         let (peer, connection) = RpcPeer::builder()
             .config(Config {
                 default_call_timeout: Duration::from_millis(10),
+                ..Config::default()
             })
             .start(stream)
             .unwrap();

@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -17,7 +20,6 @@ use crate::{
     wire::{self, Message},
 };
 
-const CAPACITY: usize = 64;
 struct Outgoing {
     bytes: Vec<u8>,
     request_id: Option<u32>,
@@ -36,6 +38,7 @@ struct Shared {
     outgoing: mpsc::Sender<Outgoing>,
     slots: Semaphore,
     call_timeout: Duration,
+    dropped_notifications: AtomicU64,
 }
 
 impl Shared {
@@ -75,6 +78,11 @@ pub struct RpcPeer {
 }
 
 impl RpcPeer {
+    /// Number of incoming notifications dropped because the shared handler budget was full.
+    pub fn dropped_notifications(&self) -> u64 {
+        self.shared.dropped_notifications.load(Ordering::Relaxed)
+    }
+
     /// Configure an immutable registry before attaching a stream.
     pub fn builder() -> PeerBuilder {
         PeerBuilder::default()
@@ -240,7 +248,7 @@ where
 {
     builder.config.validate()?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
-    let (outgoing, application) = mpsc::channel(CAPACITY);
+    let (outgoing, application) = mpsc::channel(builder.config.application_queue_capacity);
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             next_id: 0,
@@ -248,8 +256,9 @@ where
             terminal: None,
         }),
         outgoing,
-        slots: Semaphore::new(CAPACITY),
+        slots: Semaphore::new(builder.config.max_pending_calls),
         call_timeout: builder.config.default_call_timeout,
+        dropped_notifications: AtomicU64::new(0),
     });
     let peer = RpcPeer { shared };
     let (cancel, canceled) = oneshot::channel();
@@ -269,15 +278,29 @@ async fn writer<W: AsyncWrite + Unpin>(
     shared: &Shared,
     responses: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Error {
+    let mut prefer_application = true;
     loop {
-        let frame = tokio::select! {
-            Some(frame) = application.recv() => {
-                if frame.request_id.is_some_and(|id| !shared.state.lock().unwrap().pending.contains_key(&id)) { continue; }
-                frame.bytes
-            },
-            Some(frame) = responses.recv() => frame,
-            else => return Error::Closed,
+        let (frame, application_frame) = if prefer_application {
+            tokio::select! { biased;
+                Some(frame) = application.recv() => (frame, true),
+                Some(bytes) = responses.recv() => (Outgoing { bytes, request_id: None }, false),
+                else => return Error::Closed,
+            }
+        } else {
+            tokio::select! { biased;
+                Some(bytes) = responses.recv() => (Outgoing { bytes, request_id: None }, false),
+                Some(frame) = application.recv() => (frame, true),
+                else => return Error::Closed,
+            }
         };
+        prefer_application = !application_frame;
+        if frame
+            .request_id
+            .is_some_and(|id| !shared.state.lock().unwrap().pending.contains_key(&id))
+        {
+            continue;
+        }
+        let frame = frame.bytes;
         if let Err(e) = writer.write_all(&frame).await {
             return Error::Transport(e.to_string());
         }
@@ -309,7 +332,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut reader, write_half) = tokio::io::split(stream);
-    let (responses, mut response_rx) = mpsc::channel(CAPACITY);
+    let (responses, mut response_rx) = mpsc::channel(builder.config.response_queue_capacity);
     let mut handlers = JoinSet::new();
     let mut active: HashMap<Id, Option<u32>> = HashMap::new();
     let mut buffer = Vec::new();
@@ -341,7 +364,7 @@ where
                                 if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method"))) { break error; }
                                 continue;
                             };
-                            if handlers.len() >= CAPACITY {
+                            if handlers.len() >= builder.config.max_handlers {
                                 if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32000, "handler capacity exhausted"))) { break error; }
                                 continue;
                             }
@@ -350,7 +373,10 @@ where
                             active.insert(task.id(), Some(id));
                         }
                         Ok(Message::Notification { method, params }) => {
-                            if handlers.len() >= CAPACITY { continue; }
+                            if handlers.len() >= builder.config.max_handlers {
+                                peer.shared.dropped_notifications.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             if let Some(handler) = builder.notifications.get(&method).cloned() {
                                 let context = HandlerContext { peer: peer.clone() };
                                 let task = handlers.spawn(async move { handler(context, params).await });
