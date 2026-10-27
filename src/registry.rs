@@ -1,9 +1,9 @@
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{Connection, Error, HandlerContext, RemoteError, RpcPeer, Value, typed};
+use crate::{Connection, Error, HandlerContext, RemoteError, RpcParams, RpcPeer, Value, typed};
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send>>;
 pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + Send + Sync>;
@@ -31,17 +31,17 @@ impl PeerBuilder {
         self
     }
 
-    /// Register an asynchronous request handler. `A` is a tuple or sequence of arguments.
+    /// Register an asynchronous request handler. `P` is an [`RpcParams`] argument list.
     /// Duplicate names are rejected. Handler errors retain their arbitrary wire value.
-    pub fn method<A, R, F, Fut>(
+    pub fn method<P, R, F, Fut>(
         mut self,
         name: impl Into<String>,
         handler: F,
     ) -> Result<Self, Error>
     where
-        A: DeserializeOwned + Send + 'static,
+        P: RpcParams + Send + 'static,
         R: Serialize + Send + 'static,
-        F: Fn(HandlerContext, A) -> Fut + Send + Sync + 'static,
+        F: Fn(HandlerContext, P) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<R, RemoteError>> + Send + 'static,
     {
         let name = name.into();
@@ -53,16 +53,17 @@ impl PeerBuilder {
     }
 
     /// Register a typed asynchronous notification handler returning `Result<(), RemoteError>`.
+    /// `P` is an [`RpcParams`] argument list.
     /// Notification names are independent of request method names; duplicates are rejected.
     /// Handlers execute concurrently, without completion-order or delivery guarantees.
-    pub fn notification<A, F, Fut>(
+    pub fn notification<P, F, Fut>(
         mut self,
         name: impl Into<String>,
         handler: F,
     ) -> Result<Self, Error>
     where
-        A: DeserializeOwned + Send + 'static,
-        F: Fn(HandlerContext, A) -> Fut + Send + Sync + 'static,
+        P: RpcParams + Send + 'static,
+        F: Fn(HandlerContext, P) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), RemoteError>> + Send + 'static,
     {
         let name = name.into();
@@ -83,11 +84,11 @@ impl PeerBuilder {
     }
 }
 
-fn typed_handler<A, R, F, Fut>(handler: F) -> Handler
+fn typed_handler<P, R, F, Fut>(handler: F) -> Handler
 where
-    A: DeserializeOwned + Send + 'static,
+    P: RpcParams + Send + 'static,
     R: Serialize + Send + 'static,
-    F: Fn(HandlerContext, A) -> Fut + Send + Sync + 'static,
+    F: Fn(HandlerContext, P) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<R, RemoteError>> + Send + 'static,
 {
     let handler = Arc::new(handler);
@@ -95,7 +96,7 @@ where
         let handler = handler.clone();
         Box::pin(async move {
             let config = context.config().clone();
-            let args = typed::decode_args::<A>(params, config.max_incoming_bytes)?;
+            let args = typed::decode_args::<P>(params, config.max_incoming_bytes)?;
             typed::encode_result(handler(context, args).await?, &config)
         })
     })

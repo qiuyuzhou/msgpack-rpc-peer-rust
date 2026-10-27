@@ -58,9 +58,14 @@ Arguments are explicit tuples or sequences: `()` for none, `(value,)` for one,
 and `(first, second)` for two. Top-level scalars, maps, structs, and nil are
 rejected as `Error::InvalidParams`. A structured argument goes inside the list:
 `(MyArguments { ... },)`. Structs encode with named fields. A handler declares the
-matching list type and returns `Result<R, RemoteError>`; results can be any
-supported Serde value. `RemoteError::new(Value)` accepts any non-nil error value.
+matching list type implementing `RpcParams` and returns `Result<R, RemoteError>`;
+results can be any supported Serde value. `RemoteError::new(Value)` accepts any non-nil error value.
 The crate re-exports `Value` for arbitrary MessagePack data.
+
+Handler registration checks `RpcParams` at compile time. Implementations cover
+`()`, tuples of 1–16 elements, `Vec<T>`, and arrays supported by Serde.
+Custom types can implement `RpcParams` if they deserialize from an argument array.
+Incoming values and argument counts are still validated at runtime.
 
 Register a one-way handler with
 `.notification("event", |_, (value,): (u32,)| async move { Ok(()) })`, then call

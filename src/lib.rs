@@ -3,6 +3,7 @@
 mod config;
 mod encoding;
 mod error;
+mod params;
 mod peer;
 mod registry;
 mod transport;
@@ -12,6 +13,7 @@ pub use transport::SplitIo;
 
 pub use config::Config;
 pub use error::{Error, RemoteError};
+pub use params::RpcParams;
 pub use peer::{Connection, HandlerContext, RpcPeer};
 pub use registry::PeerBuilder;
 /// An arbitrary MessagePack value, including remote error payloads.

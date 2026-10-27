@@ -157,9 +157,16 @@ async fn handlers_require_explicit_argument_lists() {
         let (left, right) = tokio::io::duplex(128);
         let (a, a_connection) = RpcPeer::builder().start(left).unwrap();
         let (_b, b_connection) = RpcPeer::builder()
-            .method("struct", |_, bare: Bare| async move { Ok(bare.n) })
+            .method("struct", |_, (bare,): (Bare,)| async move { Ok(bare.n) })
             .unwrap()
-            .method("option", |_, value: Option<u32>| async move { Ok(value) })
+            .method(
+                "option",
+                |_, (value,): (Option<u32>,)| async move { Ok(value) },
+            )
+            .unwrap()
+            .method("vec", |_, args: Vec<u32>| async move { Ok(args) })
+            .unwrap()
+            .method("array", |_, args: [u32; 2]| async move { Ok(args) })
             .unwrap()
             .start(right)
             .unwrap();
@@ -173,8 +180,29 @@ async fn handlers_require_explicit_argument_lists() {
         );
         assert_eq!(
             a.request::<_, Option<u32>>("option", ()).await,
-            Err(invalid)
+            Err(invalid.clone())
         );
+        assert_eq!(
+            a.request::<_, u32>("struct", (std::collections::BTreeMap::from([("n", 7)]),))
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            a.request::<_, Option<u32>>("option", (Some(7),))
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            a.request::<_, Vec<u32>>("vec", (1, 2, 3)).await.unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            a.request::<_, [u32; 2]>("array", (1, 2)).await.unwrap(),
+            [1, 2]
+        );
+        assert_eq!(a.request::<_, [u32; 2]>("array", (1,)).await, Err(invalid));
         a_connection.terminate();
         a_connection.wait().await.unwrap();
         b_connection.terminate();
