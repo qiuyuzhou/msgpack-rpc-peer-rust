@@ -212,7 +212,8 @@ impl RpcPeer {
 
     /// Send an explicit argument list and decode a typed result.
     /// Use `()` for no arguments and `(value,)` for one argument.
-    /// Calls wait for bounded capacity; dropping the future releases its pending entry.
+    /// The configured whole-call timeout includes capacity and response waits.
+    /// Dropping the future releases its pending entry; started writes may still execute remotely.
     pub async fn request<A: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
@@ -297,6 +298,8 @@ impl RpcPeer {
 }
 
 /// Capabilities supplied to a method handler, including reverse RPC requests.
+/// Active handlers may initiate work during graceful draining. That privilege expires
+/// when their handler finishes, even if a cloned context survives.
 #[derive(Clone)]
 pub struct HandlerContext {
     peer: RpcPeer,

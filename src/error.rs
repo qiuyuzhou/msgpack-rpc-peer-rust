@@ -42,7 +42,7 @@ pub enum Error {
     /// A method name was registered twice before startup.
     #[error("duplicate method registration")]
     DuplicateMethod,
-    /// Configuration contains zero limits or an unsupported depth (greater than 1024).
+    /// Configuration or a deadline override contains an unsupported limit or duration.
     #[error("invalid connection configuration: {0}")]
     InvalidConfig(&'static str),
     /// Startup requires an existing Tokio runtime.
