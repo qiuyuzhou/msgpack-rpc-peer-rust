@@ -15,9 +15,8 @@ msgpack-rpc-peer = { path = "../msgpack-rpc-peer" }
 tokio = { version = "1.53", features = ["rt", "macros", "io-util"] }
 ```
 
-The declared MSRV is Rust 1.85: edition 2024 and the selected `rmp`, `rmp-serde`,
-`rmpv`, and Tokio versions require it. The locked dependency metadata declares no
-higher minimum.
+The MSRV is Rust 1.85: edition 2024 and the selected `rmp`, `rmp-serde`, `rmpv`,
+and Tokio versions require it, and the lockfile declares no higher minimum.
 
 ## Basic usage
 
@@ -47,83 +46,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`PeerBuilder` registers typed asynchronous methods and notifications before
-`start` consumes it. Duplicate names fail with `Error::DuplicateMethod`; request
-and notification names have separate registries. Startup validates configuration
-and requires the current Tokio runtime. It returns a cloneable `RpcPeer` and a
-separate `Connection` owner; retain the owner while using the peer.
+`PeerBuilder` registers typed asynchronous methods and notifications, and `start`
+consumes it, validates the configuration, and requires the current Tokio runtime.
+It returns a cloneable `RpcPeer` and a separate `Connection` owner; keep the owner
+alive while you use the peer. Duplicate names fail with `Error::DuplicateMethod`,
+and request and notification names have separate registries.
 
 Arguments are explicit tuples or sequences: `()` for none, `(value,)` for one,
-and `(first, second)` for two. Top-level scalars, maps, structs, and nil are
-rejected as `Error::InvalidParams`. A structured argument goes inside the list:
-`(MyArguments { ... },)`. Structs encode with named fields. A handler declares the
+`(first, second)` for two. Top-level scalars, maps, structs, and nil are rejected
+as `Error::InvalidParams`. A structured argument goes inside the list as
+`(MyArguments { ... },)` and encodes with named fields. A handler declares the
 matching list type implementing `RpcParams` and returns `Result<R, RemoteError>`;
-results can be any supported Serde value. `RemoteError::new(Value)` accepts any non-nil error value.
-The crate re-exports `Value` for arbitrary MessagePack data.
+results can be any supported Serde value. `RemoteError::new(Value)` accepts any
+non-nil error value. The crate re-exports `Value` for arbitrary MessagePack data.
 
 Handler registration checks `RpcParams` at compile time. Implementations cover
-`()`, tuples of 1–16 elements, `Vec<T>`, and arrays supported by Serde.
-Custom types can implement `RpcParams` if they deserialize from an argument array.
+`()`, tuples of 1–16 elements, `Vec<T>`, and the arrays Serde supports. Custom
+types can implement `RpcParams` if they deserialize from an argument array.
 Incoming values and argument counts are still validated at runtime.
 
 Register a one-way handler with
 `.notification("event", |_, (value,): (u32,)| async move { Ok(()) })`, then call
-`peer.notify("event", (value,)).await`. Success acknowledges local queueing, not
-remote delivery, execution, or success. Notifications consume no request ID or
-pending-call slot and never receive responses. Unknown notifications are ignored;
-invalid typed arguments and other notification failures are counted.
+`peer.notify("event", (value,)).await`. A successful await means the notification
+is queued locally; it does not confirm remote delivery, execution, or success.
+Notifications consume no request ID or pending-call slot and never receive
+responses. Unknown notifications are ignored; invalid typed arguments and other
+notification failures are counted.
 
 ## Concurrency, calls, and cancellation
 
-Handlers receive a `HandlerContext`; `context.request(...)` and `context.notify(...)`
-initiate reverse operations while the receive loop continues processing responses.
-Requests and notifications share a bounded concurrent handler budget and can finish
-out of arrival order. Multiple outstanding outgoing calls correlate responses by ID.
-Both endpoints have independent outgoing ID namespaces, so opposite requests with
-the same numeric ID do not collide. Incoming request IDs remain active from admission
-until their response has been completely written and flushed, including unknown
-method and overload responses. Repeating an ID during that interval is a fatal
-protocol violation. A remote peer may reuse an incoming ID after that response
-completes; this library's own outgoing IDs still never repeat.
+Handlers receive a `HandlerContext`; `context.request(...)` and
+`context.notify(...)` initiate reverse operations while the receive loop continues
+processing responses. Requests and notifications share a bounded concurrent
+handler budget and can finish out of arrival order. Multiple outstanding outgoing
+calls correlate responses by ID. Both endpoints have independent outgoing ID
+namespaces, so opposite requests with the same numeric ID do not collide. An
+incoming request ID stays active from admission until its response is written and
+flushed, including unknown-method and overload responses; repeating the ID in
+that window is a fatal protocol violation. After the response completes, the
+remote peer may reuse the ID, though this library's outgoing IDs never repeat.
 
 `request` has a 30-second whole-call deadline by default. Set
-`Config::default_call_timeout`, or use `request_with_timeout(method, args, duration)`
-on either peer or handler context. The deadline includes pending-slot and outgoing
-queue waits, serialization, and response waiting. Synchronous Serde code and
-handler code cannot be preempted by an asynchronous deadline.
+`Config::default_call_timeout`, or use `request_with_timeout(method, args,
+duration)` on either peer or handler context. The deadline includes pending-slot
+and outgoing-queue waits, serialization, and response waiting. Synchronous Serde
+code and handler code cannot be preempted by an asynchronous deadline.
 
 Dropping, aborting, or timing out a call removes its pending entry and releases
 capacity. Calls canceled before their frame starts writing are skipped. A started
 frame finishes while the connection remains active, preserving framing; local
-cancellation cannot prevent remote side effects. Late and otherwise unmatched
-responses are discarded. Outgoing u32 IDs increase without reuse even after
-cancellation; exhaustion returns `Error::ResourceLimit("message ID namespace")`
-instead of wrapping. `Error::Timeout` leaves the connection usable.
+cancellation cannot prevent remote side effects. Late and unmatched responses are
+discarded. Outgoing u32 IDs increase without reuse even after cancellation;
+exhaustion returns `Error::ResourceLimit("message ID namespace")` instead of
+wrapping. `Error::Timeout` leaves the connection usable.
 
 ## Connection lifecycle
 
 `Connection::shutdown()` starts graceful draining with a five-second deadline;
 `shutdown_with_timeout(duration)` overrides it. New application calls and
-notifications return `Error::Draining`. Operations already admitted, including
-capacity waiters, may finish. Active handlers retain reverse-call admission;
-cloned contexts lose this privilege when their handler ends. Incoming work remains
-admissible within the same bounds because standard messages cannot identify
+notifications return `Error::Draining`, while operations already admitted,
+including capacity waiters, may finish. Active handlers retain reverse-call
+admission; cloned contexts lose it when their handler ends. Incoming work stays
+admissible within the same bounds, because standard messages cannot identify
 reverse calls. Sustained traffic never extends the fixed deadline.
 
 Successful draining waits for admitted operations, handlers, queued frames, and
-in-flight writes. At deadline expiration, remaining work is canceled and joined;
-the owner and pending calls receive `Error::ShutdownTimeout`. `terminate()`
-initiates immediate cancellation. `wait()` observes transport release and all
-supervised handler termination. Local termination and clean EOF complete the
-owner successfully, while outstanding calls fail with `Error::Closed`; malformed
-traffic, resource violations, and I/O failures preserve their terminal cause.
-EOF can therefore end a drain before all accepted work succeeds.
+in-flight writes. At the deadline, remaining work is canceled and joined, and the
+owner and pending calls receive `Error::ShutdownTimeout`. `terminate()` cancels
+immediately. `wait()` resolves when the transport is released and all supervised
+handlers have ended. Local termination and clean EOF complete the owner
+successfully, and outstanding calls fail with `Error::Closed`; malformed traffic,
+resource violations, and I/O failures keep their terminal cause, so EOF can end a
+drain before all accepted work succeeds.
 
-Dropping the owner initiates cancellation even if peer handles or contexts survive.
-A destructor cannot synchronously join tasks. Canceling a `wait` or shutdown future
-also drops its owner and initiates cancellation. The supervisor owns the read and
-single-writer futures and a bounded set of handler tasks. Internal locks do not
-span asynchronous waits.
+Dropping the owner initiates cancellation even if peer handles or contexts
+survive. A destructor cannot synchronously join tasks, and canceling a `wait` or
+shutdown future also drops its owner and cancels. The supervisor owns the read
+and single-writer futures and a bounded set of handler tasks. Internal locks do
+not span asynchronous waits.
 
 ## Configuration and resource bounds
 
@@ -143,52 +143,52 @@ validates it before spawning work.
 | `default_call_timeout` | 30 seconds | Whole-call deadline |
 | `graceful_shutdown_timeout` | 5 seconds | Fixed drain deadline |
 
-Byte and node limits must be positive. Depth must be between 1 and 1024. Work and
-queue capacities must be positive and within Tokio's semaphore limit. Default
+Byte and node limits must be positive, and depth must be between 1 and 1024. Work
+and queue capacities must be positive and within Tokio's semaphore limit. Default
 deadlines must be positive and representable by the monotonic clock; unsupported
 per-operation deadline overrides also return `Error::InvalidConfig`.
 
 Application operations wait for bounded pending or queue capacity. The receive
-loop never waits for a handler or writer slot: excess requests receive an overload
-error and excess notifications are dropped and counted. Full response queues
-terminate with `Error::ResourceLimit("response queue")`. The writer alternates
-preference between application and response queues. Response processing remains
-independent of handler execution and sustained application writes. Finite budgets
-allow bounded overload failure rather than guaranteed successful arbitrary nesting.
+loop never waits for a handler or writer slot: excess requests get an overload
+error, and excess notifications are dropped and counted. A full response queue
+terminates the connection with `Error::ResourceLimit("response queue")`. The
+writer alternates preference between the application and response queues, so
+response processing stays independent of handler execution and sustained
+application writes. Budgets are finite, so overload fails in a bounded way; the
+library does not guarantee success for arbitrary nesting.
 
 The incremental scanner checks MessagePack headers before allocating decoded
-containers. It rejects hostile advertised string, binary, extension, array, and map
-lengths against byte and node budgets. Encoded buffering is bounded by the incoming
-byte limit. Fragmented and concatenated objects need no delimiter or length prefix.
-Arguments and results also undergo depth/node checks before conversion to dynamic
-values; the complete outgoing envelope is byte bounded during serialization.
-Unknown-length Serde sequences, maps, and formatted strings obey the same encoding
-byte limit without unbounded staging buffers. Rejected outgoing calls and
-notifications emit no partial frame. Oversized or
-unserializable results and errors use a generic remote failure if it fits; otherwise
-the connection terminates with `Error::Encode` instead of stranding a remote call.
+containers, and rejects hostile advertised string, binary, extension, array, and
+map lengths against the byte and node budgets. Encoded buffering is bounded by
+the incoming byte limit, and fragmented or concatenated objects need no delimiter
+or length prefix. Arguments and results also pass depth and node checks before
+conversion to dynamic values, and the complete outgoing envelope stays within the
+byte limit during serialization. Unknown-length Serde sequences, maps, and
+formatted strings obey the same encoding byte limit without unbounded staging
+buffers. Rejected outgoing calls and notifications emit no partial frame.
+Oversized or unserializable results and errors use a generic remote failure if it
+fits; otherwise the connection terminates with `Error::Encode` instead of
+stranding a remote call.
 
 Queue slots are reserved before application serialization, so capacity waiters
-retain no library-encoded frame. Reserved queue slots, the single active writer,
-active handlers and their result conversions, and the reader have separate bounded
+hold no library-encoded frame. Reserved slots, the single active writer, active
+handlers and their result conversions, and the reader each have separate bounded
 costs. Active incoming IDs are bounded by admitted handlers, queued responses,
-and the one in-flight response. Byte buffers, value nodes, queue counts, and active-work counts do not specify
-allocator overhead or a total process-memory bound. Application-provided arguments,
-custom Serde implementations, transport implementations, and handlers remain
-responsible for their own allocations and CPU use.
+and the one in-flight response. The byte, node, queue, and active-work counts do
+not include allocator overhead or bound total process memory. Application-provided
+arguments, custom Serde implementations, transport implementations, and handlers
+remain responsible for their own allocations and CPU use.
 
 ## Errors and diagnostics
 
-Local `Error` categories distinguish `Transport`, `Decode`, `Protocol`, `Encode`,
+Local `Error` has the categories `Transport`, `Decode`, `Protocol`, `Encode`,
 `InvalidParams`, `InvalidResult`, `ResourceLimit`, `Timeout`, `Draining`,
 `ShutdownTimeout`, `Closed`, `DuplicateMethod`, `InvalidConfig`, and `NoRuntime`.
 `Error::Remote(Value)` preserves an arbitrary non-nil remote failure without
 assuming a schema. Valid unknown methods and invalid typed arguments produce
-remote failures while leaving the connection usable. Malformed envelopes,
-duplicate active incoming IDs, invalid MessagePack, truncated EOF, and fatal wire
-resource violations terminate the connection and resolve pending calls.
-
-Library-generated remote errors use `{ "code": integer, "message": string }`:
+remote failures and leave the connection usable. Malformed envelopes, duplicate
+active incoming IDs, invalid MessagePack, truncated EOF, and fatal wire resource
+violations terminate the connection and resolve pending calls.
 
 | Code | Message | Trigger |
 | --- | --- | --- |
@@ -201,23 +201,24 @@ Library-generated remote errors use `{ "code": integer, "message": string }`:
 
 These codes are library conventions, not MessagePack-RPC standard codes.
 Notification errors and panics have no response. Under panic unwinding, handler
-invocation and future execution are isolated in supervised tasks. Panic-abort builds
-cannot recover from panics.
+invocation and future execution are isolated in supervised tasks; panic-abort
+builds cannot recover from panics.
 
 `peer.diagnostics()` returns fixed counters for handler panics, notification
-failures, dropped notifications, and lost events, even when observation is disabled.
-`peer.dropped_notifications()` reads the drop counter directly. Snapshots read
-counters independently. Enable `builder.diagnostic_events(true)`, then take the
-optional stream once with `connection.take_events()` and await `events.recv()`.
-It holds at most `DIAGNOSTIC_EVENT_CAPACITY` (64) fixed enum events; a full or dropped
-receiver increments `lost_events`. Disabled observation loses no events. Producers
-never wait for event consumers or spawn additional tasks. The stream closes when
-the connection terminates, even if handles survive.
+failures, dropped notifications, and lost events, even when observation is
+disabled. `peer.dropped_notifications()` reads the drop counter directly, and
+snapshots read counters independently. To observe events, enable
+`builder.diagnostic_events(true)`, take the optional stream once with
+`connection.take_events()`, and await `events.recv()`. The stream holds at most
+`DIAGNOSTIC_EVENT_CAPACITY` (64) fixed enum events; a full or dropped receiver
+increments `lost_events`. Disabled observation loses no events, producers never
+wait for consumers or spawn extra tasks, and the stream closes when the
+connection terminates, even if handles survive.
 
-Library-generated handler errors and diagnostic events exclude parameters,
-remote method names, and panic payloads. This does not control application logging,
-application-provided remote errors, custom serializer errors, or the process panic
-hook, which executes before a panic is caught.
+Library-generated handler errors and diagnostic events exclude parameters, remote
+method names, and panic payloads. They do not cover application logging,
+application-provided remote errors, custom serializer errors, or the process
+panic hook, which runs before a panic is caught.
 
 ## Wire interoperability and transports
 
@@ -228,18 +229,18 @@ defines the envelopes used here:
 - Response: `[1, u32_id, error, result]`.
 - Notification: `[2, string_method, array_params]`.
 
-Success has nil error; failure has a non-nil error and nil result. Messages are
-consecutive MessagePack objects with no extra framing, handshake, or custom types.
-Named struct fields and explicit argument lists make the Rust contract usable by
-an independent peer. Tests inspect literal independent request, response, and
-notification fixtures, arbitrary remote errors, fragmented headers/payloads, and
-concatenated objects; two-library round trips are additional behavior tests.
+Success has a nil error; failure has a non-nil error and a nil result. Messages
+are consecutive MessagePack objects with no extra framing, handshake, or custom
+types. Named struct fields and explicit argument lists keep the Rust contract
+usable by an independent peer. Tests use literal independent fixtures for
+requests, responses, and notifications, plus arbitrary remote errors, fragmented
+headers and payloads, concatenated objects, and two-library round trips.
 
-Attach any owned `AsyncRead + AsyncWrite + Unpin + Send + 'static` stream. Unix
+Attach any owned `AsyncRead + AsyncWrite + Unpin + Send + 'static` stream; Unix
 sockets use the same API on supported platforms. `SplitIo::new(reader, writer)`
-pairs separate handles, such as child stdout and stdin, without taking ownership
-of the process or adding buffering. Reserve subprocess stdout for RPC bytes and
-send diagnostics to stderr. See the [transport guide](docs/transports.md) and accepted
+pairs separate handles, such as child stdout and stdin, without owning the
+process or adding buffering. Reserve subprocess stdout for RPC bytes and send
+diagnostics to stderr. See the [transport guide](docs/transports.md) and the
 [architecture overview](docs/architecture.md).
 
 ## Dependencies and verification
@@ -260,9 +261,9 @@ examples. There are no crate-specific optional features.
 
 The [GitHub Actions CI workflow](.github/workflows/ci.yml) runs on pushes, pull
 requests, and manual dispatch. It checks formatting, Clippy, and documentation on
-stable Rust, runs tests (including doctests) on Linux and macOS,
-and checks all targets with Rust 1.85 on Linux. Cargo commands use `--locked` to
-validate the committed dependency versions.
+stable Rust, runs tests including doctests on Linux and macOS, and checks all
+targets with Rust 1.85 on Linux. Cargo commands use `--locked` to validate the
+committed dependency versions.
 
 ### Commit checks
 
@@ -278,16 +279,16 @@ pre-commit run --all-files
 
 The [pre-commit configuration](.pre-commit-config.yaml) checks staged whitespace
 and conflict markers on every commit. Rust source or manifest changes trigger
-format checking; Rust source, dependency, toolchain, or Cargo configuration changes
-trigger Clippy with warnings denied, including checks for examples. Workflow
-changes trigger actionlint. Hooks check files without automatically fixing them.
-Tests, documentation builds, and MSRV checks remain in CI; hooks do not run examples.
+format checking; Rust source, dependency, toolchain, or Cargo configuration
+changes trigger Clippy with warnings denied, including examples. Workflow changes
+trigger actionlint. Hooks check files without fixing them; tests, documentation
+builds, and MSRV checks stay in CI, and hooks do not run examples.
 
-Use `pre-commit install` without `--overwrite` to preserve existing hooks through
-pre-commit's migration mode. During commits, pre-commit temporarily hides unstaged
-changes to tracked files; Cargo still checks the whole crate and may see untracked
-files. Manual `--all-files` runs check the current working tree; the staged-diff
-hook always checks the index.
+`pre-commit install` without `--overwrite` preserves existing hooks through
+pre-commit's migration mode. During a commit, pre-commit temporarily hides
+unstaged changes to tracked files, but Cargo still checks the whole crate and may
+see untracked files. Manual `--all-files` runs check the working tree; the
+staged-diff hook always checks the index.
 
 ### Local verification
 
@@ -305,18 +306,8 @@ cargo run --locked --example unix
 cargo run --locked --example subprocess
 ```
 
-The Unix example runs only on Unix and reports that limitation elsewhere.
-Subprocess tests use a separate executable harness so test output cannot corrupt
-RPC stdout. Validation includes actual Unix sockets and child processes, bounded
-queue saturation, cancellation, panic diagnostics, and owned shutdown. Compiler
-and platform coverage beyond the validation environment remain unverified.
-
-## Remaining limitations
-
-There is no reconnect/retry policy,
-connection pool, runtime ownership, process management, authentication, encryption,
-remote cancellation, shutdown handshake, mutable registry, reliable notification
-delivery, or notification completion ordering. Applications supply transport
-security and any stronger ordering or acknowledgment policy. The library cannot
-preempt blocking synchronous application code, bound application-owned allocations,
-recover from panic-abort, or synchronously join work from a destructor.
+The `unix` example runs only on Unix. Subprocess tests use a separate executable
+harness so test output cannot corrupt RPC stdout. Tests cover real Unix sockets
+and child processes, bounded queue saturation, cancellation, panic diagnostics,
+and owned shutdown. Compiler and platform coverage beyond this validation
+environment remains unverified.
