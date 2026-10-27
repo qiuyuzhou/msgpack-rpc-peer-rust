@@ -10,7 +10,7 @@ use std::{
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::{Notify, Semaphore, mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::{Id, JoinHandle, JoinSet},
 };
 
@@ -23,6 +23,8 @@ use crate::{
 
 mod incoming;
 use incoming::{IncomingRequest, IncomingRequests};
+mod outgoing;
+use outgoing::{OutgoingRequest, PendingRequests};
 
 struct Outgoing {
     bytes: Vec<u8>,
@@ -31,11 +33,8 @@ struct Outgoing {
     _frame: WorkGuard,
 }
 
-type Reply = oneshot::Sender<Result<Value, Error>>;
-
 struct State {
-    next_id: u64,
-    pending: HashMap<u32, Reply>,
+    pending: PendingRequests,
     terminal: Option<Error>,
     drain_deadline: Option<tokio::time::Instant>,
     operations: usize,
@@ -45,7 +44,6 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     outgoing: mpsc::Sender<Outgoing>,
-    slots: Semaphore,
     config: crate::Config,
     diagnostics: Diagnostics,
     changed: Notify,
@@ -106,10 +104,7 @@ impl Shared {
         self.diagnostics.close();
         let mut state = self.state.lock().unwrap();
         state.terminal = Some(error.clone());
-        self.slots.close();
-        for (_, reply) in state.pending.drain() {
-            let _ = reply.send(Err(error.clone()));
-        }
+        state.pending.finish(error);
     }
 }
 
@@ -138,16 +133,6 @@ impl Drop for HandlerLease {
     fn drop(&mut self) {
         let _state = self.shared.state.lock().unwrap();
         self.active.store(false, Ordering::Relaxed);
-    }
-}
-
-struct PendingGuard {
-    shared: Arc<Shared>,
-    id: u32,
-}
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        self.shared.state.lock().unwrap().pending.remove(&self.id);
     }
 }
 
@@ -249,44 +234,10 @@ impl RpcPeer {
         lease: Option<&AtomicBool>,
     ) -> Result<R, Error> {
         let _operation = self.shared.admit(lease)?;
-        let _slot = self
-            .shared
-            .slots
-            .acquire()
+        OutgoingRequest::begin(&self.shared)
+            .await?
+            .send(method, args)
             .await
-            .map_err(|_| self.shared.terminal())?;
-        let (sender, receiver) = oneshot::channel();
-        let id = {
-            let mut state = self.shared.state.lock().unwrap();
-            if let Some(error) = &state.terminal {
-                return Err(error.clone());
-            }
-            let id = u32::try_from(state.next_id)
-                .map_err(|_| Error::ResourceLimit("message ID namespace"))?;
-            state.next_id += 1;
-            state.pending.insert(id, sender);
-            id
-        };
-        let _pending = PendingGuard {
-            shared: self.shared.clone(),
-            id,
-        };
-        let permit = self
-            .shared
-            .outgoing
-            .reserve()
-            .await
-            .map_err(|_| self.shared.terminal())?;
-        let args = wire::encode(&Arguments(args), self.shared.config.max_outgoing_bytes)
-            .map_err(|_| Error::InvalidParams)?;
-        let params = wire::value(args, &self.shared.config).map_err(|_| Error::InvalidParams)?;
-        let frame = wire::encode(
-            &(0u8, id, method, params),
-            self.shared.config.max_outgoing_bytes,
-        )?;
-        self.shared.commit(permit, frame, Some(id))?;
-        let value = receiver.await.map_err(|_| self.shared.terminal())??;
-        wire::decode(value, self.shared.config.max_incoming_bytes)
     }
 }
 
@@ -414,15 +365,13 @@ where
         diagnostics,
         changed: Notify::new(),
         state: Mutex::new(State {
-            next_id: 0,
-            pending: HashMap::new(),
+            pending: PendingRequests::new(builder.config.max_pending_calls),
             terminal: None,
             drain_deadline: None,
             operations: 0,
             frames: 0,
         }),
         outgoing,
-        slots: Semaphore::new(builder.config.max_pending_calls),
         config: builder.config.clone(),
     });
     let peer = RpcPeer { shared };
@@ -463,7 +412,7 @@ async fn writer<W: AsyncWrite + Unpin>(
         prefer_application = !application_frame;
         if frame
             .request_id
-            .is_some_and(|id| !shared.state.lock().unwrap().pending.contains_key(&id))
+            .is_some_and(|id| !shared.state.lock().unwrap().pending.is_active(id))
         {
             continue;
         }
@@ -557,7 +506,7 @@ where
                     match message {
                         Err(error) => break error,
                         Ok(Message::Response { id, outcome }) => {
-                            if let Some(reply) = peer.shared.state.lock().unwrap().pending.remove(&id) { let _ = reply.send(outcome); }
+                            peer.shared.state.lock().unwrap().pending.complete(id, outcome);
                         }
                         Ok(Message::Request { id, method, params }) => {
                             let incoming = match incoming_requests.admit(id) {
@@ -609,33 +558,5 @@ where
         Ok(())
     } else {
         Err(terminal)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn exhausted_ids_fail_without_wrapping() {
-        let (stream, mut raw) = tokio::io::duplex(64);
-        let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
-        peer.shared.state.lock().unwrap().next_id = u32::MAX as u64;
-        let (result, ()) = tokio::join!(
-            peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10)),
-            async {
-                use tokio::io::AsyncReadExt;
-                let mut bytes = [0; 10];
-                raw.read_exact(&mut bytes).await.unwrap();
-                assert_eq!(&bytes, b"\x94\x00\xce\xff\xff\xff\xff\xa1x\x90");
-            }
-        );
-        assert_eq!(result, Err(Error::Timeout));
-        assert_eq!(
-            peer.request::<_, ()>("x", ()).await,
-            Err(Error::ResourceLimit("message ID namespace"))
-        );
-        connection.terminate();
-        connection.wait().await.unwrap();
     }
 }

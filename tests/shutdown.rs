@@ -223,8 +223,7 @@ async fn invalid_shutdown_deadlines_fail_without_panicking() {
     ));
 }
 
-#[tokio::test]
-async fn a_notification_does_not_commit_after_terminal_cleanup() {
+async fn termination_during_serialization(request: bool) {
     use std::sync::Mutex;
     struct PausedSerialization {
         started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -253,13 +252,17 @@ async fn a_notification_does_not_commit_after_terminal_cleanup() {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(peer.notify(
-                    "x",
-                    PausedSerialization {
+                .block_on(async move {
+                    let args = PausedSerialization {
                         started: Mutex::new(Some(started_tx)),
                         release: release_rx,
-                    },
-                ))
+                    };
+                    if request {
+                        peer.request::<_, ()>("x", (args,)).await
+                    } else {
+                        peer.notify("x", args).await
+                    }
+                })
         });
         started_rx.await.unwrap();
         connection.terminate();
@@ -269,6 +272,16 @@ async fn a_notification_does_not_commit_after_terminal_cleanup() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn a_notification_does_not_commit_after_terminal_cleanup() {
+    termination_during_serialization(false).await;
+}
+
+#[tokio::test]
+async fn termination_during_request_serialization_preserves_terminal_error() {
+    termination_during_serialization(true).await;
 }
 
 #[tokio::test]

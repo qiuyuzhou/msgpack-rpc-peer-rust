@@ -22,6 +22,8 @@ Request and notification handlers share one concurrency budget. Excess requests 
 
 Pending outgoing calls are bounded and correlated by unsigned 32-bit IDs that are never reused on the same connection. Cancellation removes the pending entry; late and otherwise unmatched responses are discarded. Incoming IDs belong to the other peer's independent namespace. Duplicate active incoming IDs terminate the connection.
 
+A private outgoing request module owns ID allocation, pending capacity, response correlation and cancellation cleanup. The call future retains its credential through result decoding; queued frames only identify which call must still be active before writing starts. Terminal failure and pending registration remain synchronized with connection state under the same lock.
+
 A private incoming request module owns incoming ID registration and response queuing. Admission returns an ID-owning credential; submitting a response consumes it and transfers ownership to the queued frame until writing and flushing complete, or connection termination discards the frame.
 
 ## Failure and shutdown

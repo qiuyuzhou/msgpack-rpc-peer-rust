@@ -5,6 +5,35 @@ use tokio::{
 };
 
 #[tokio::test]
+async fn invalid_arguments_release_pending_capacity_without_reusing_the_id() {
+    timeout(Duration::from_secs(3), async {
+        let (stream, mut raw) = tokio::io::duplex(64);
+        let (peer, connection) = RpcPeer::builder()
+            .config(Config {
+                max_pending_calls: 1,
+                ..Config::default()
+            })
+            .start(stream)
+            .unwrap();
+        assert_eq!(
+            peer.request::<_, ()>("x", 7).await,
+            Err(Error::InvalidParams)
+        );
+        let (result, ()) = tokio::join!(peer.request::<_, u32>("x", ()), async {
+            let mut bytes = [0; 6];
+            raw.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"\x94\x00\x01\xa1x\x90");
+            raw.write_all(b"\x94\x01\x01\xc0\x2a").await.unwrap();
+        });
+        assert_eq!(result, Ok(42));
+        connection.terminate();
+        connection.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn timed_out_calls_ignore_late_responses_and_never_reuse_ids() {
     timeout(Duration::from_secs(3), async {
         let (stream, mut raw) = tokio::io::duplex(64);
