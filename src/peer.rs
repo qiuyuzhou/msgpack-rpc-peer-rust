@@ -1,9 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -15,8 +12,9 @@ use tokio::{
 };
 
 use crate::{
-    Error, PeerBuilder, RemoteError, Value,
+    DiagnosticEvent, DiagnosticEvents, DiagnosticsSnapshot, Error, PeerBuilder, RemoteError, Value,
     arguments::Arguments,
+    diagnostics::Diagnostics,
     wire::{self, Message},
 };
 
@@ -37,8 +35,8 @@ struct Shared {
     state: Mutex<State>,
     outgoing: mpsc::Sender<Outgoing>,
     slots: Semaphore,
-    dropped_notifications: AtomicU64,
     config: crate::Config,
+    diagnostics: Diagnostics,
 }
 
 impl Shared {
@@ -52,6 +50,7 @@ impl Shared {
     }
 
     fn finish(&self, error: Error) {
+        self.diagnostics.close();
         let mut state = self.state.lock().unwrap();
         state.terminal = Some(error.clone());
         self.slots.close();
@@ -78,9 +77,14 @@ pub struct RpcPeer {
 }
 
 impl RpcPeer {
-    /// Number of incoming notifications dropped because the shared handler budget was full.
+    /// Read fixed diagnostic counters without consuming optional events.
+    pub fn diagnostics(&self) -> DiagnosticsSnapshot {
+        self.shared.diagnostics.snapshot()
+    }
+
+    /// Number of notifications dropped because the shared handler budget was full.
     pub fn dropped_notifications(&self) -> u64 {
-        self.shared.dropped_notifications.load(Ordering::Relaxed)
+        self.diagnostics().dropped_notifications
     }
 
     /// Configure an immutable registry before attaching a stream.
@@ -227,11 +231,17 @@ impl HandlerContext {
 /// Drop initiates cancellation. Use [`Self::wait`] to observe completed cleanup.
 #[must_use = "dropping the connection cancels transport and handlers"]
 pub struct Connection {
+    events: Option<DiagnosticEvents>,
     cancel: Mutex<Option<oneshot::Sender<()>>>,
     task: Option<JoinHandle<Result<(), Error>>>,
 }
 
 impl Connection {
+    /// Take the optional event stream once. Enable it on the builder before startup.
+    pub fn take_events(&mut self) -> Option<DiagnosticEvents> {
+        self.events.take()
+    }
+
     /// Initiate immediate cancellation. This does not drain accepted work.
     pub fn terminate(&self) {
         if let Some(cancel) = self.cancel.lock().unwrap().take() {
@@ -262,7 +272,9 @@ where
     builder.config.validate()?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
     let (outgoing, application) = mpsc::channel(builder.config.application_queue_capacity);
+    let (diagnostics, events) = Diagnostics::new(builder.diagnostic_events);
     let shared = Arc::new(Shared {
+        diagnostics,
         state: Mutex::new(State {
             next_id: 0,
             pending: HashMap::new(),
@@ -270,7 +282,6 @@ where
         }),
         outgoing,
         slots: Semaphore::new(builder.config.max_pending_calls),
-        dropped_notifications: AtomicU64::new(0),
         config: builder.config.clone(),
     });
     let peer = RpcPeer { shared };
@@ -279,6 +290,7 @@ where
     Ok((
         peer,
         Connection {
+            events,
             cancel: Mutex::new(Some(cancel)),
             task: Some(task),
         },
@@ -367,11 +379,20 @@ where
                 _ = &mut canceled => break Error::Closed,
                 error = &mut writing => break error,
                 completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
-                    let (task_id, outcome) = match completed.unwrap() {
+                    let completion = completed.unwrap();
+                    let panicked = completion.is_err();
+                    let (task_id, outcome) = match completion {
                         Ok((task_id, outcome)) => (task_id, outcome),
-                        Err(error) => (error.id(), Err(RemoteError::builtin(-32603, "handler failed"))),
+                        Err(error) => {
+                            peer.shared.diagnostics.record(DiagnosticEvent::HandlerPanicked);
+                            (error.id(), Err(RemoteError::builtin(-32603, "handler failed")))
+                        },
                     };
-                    if let Some(id) = active.remove(&task_id).unwrap() {
+                    let incoming_id = active.remove(&task_id).unwrap();
+                    if incoming_id.is_none() && outcome.is_err() && !panicked {
+                        peer.shared.diagnostics.record(DiagnosticEvent::NotificationFailed);
+                    }
+                    if let Some(id) = incoming_id {
                         if let Err(error) = respond(&responses, id, outcome, builder.config.max_outgoing_bytes) { break error; }
                     }
                 }
@@ -397,7 +418,7 @@ where
                         }
                         Ok(Message::Notification { method, params }) => {
                             if handlers.len() >= builder.config.max_handlers {
-                                peer.shared.dropped_notifications.fetch_add(1, Ordering::Relaxed);
+                                peer.shared.diagnostics.record(DiagnosticEvent::NotificationDropped);
                                 continue;
                             }
                             if let Some(handler) = builder.notifications.get(&method).cloned() {

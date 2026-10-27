@@ -11,12 +11,20 @@ pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + S
 /// Register typed methods before consuming the builder to start a connection.
 #[derive(Default)]
 pub struct PeerBuilder {
+    pub(crate) diagnostic_events: bool,
     pub(crate) config: crate::Config,
     pub(crate) methods: HashMap<String, Handler>,
     pub(crate) notifications: HashMap<String, Handler>,
 }
 
 impl PeerBuilder {
+    /// Enable a bounded diagnostic event stream, disabled by default.
+    /// Retrieve it once with `Connection::take_events`; counters are always enabled.
+    pub fn diagnostic_events(mut self, enabled: bool) -> Self {
+        self.diagnostic_events = enabled;
+        self
+    }
+
     /// Set limits and deadlines, validated when the connection starts.
     pub fn config(mut self, config: crate::Config) -> Self {
         self.config = config;
