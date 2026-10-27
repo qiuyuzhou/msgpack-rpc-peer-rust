@@ -94,9 +94,9 @@ where
     Arc::new(move |context, params| {
         let handler = handler.clone();
         Box::pin(async move {
-            let args = A::deserialize(crate::arguments::ListDeserializer(params))
-                .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
             let config = context.config().clone();
+            let args = crate::arguments::decode::<A>(params, config.max_incoming_bytes)
+                .map_err(|_| RemoteError::builtin(-32602, "invalid parameters"))?;
             encode_result(handler(context, args).await?, &config)
         })
     })

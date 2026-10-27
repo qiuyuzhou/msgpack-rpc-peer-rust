@@ -2,6 +2,7 @@
 
 mod arguments;
 mod config;
+mod encoding;
 mod error;
 mod peer;
 mod registry;
