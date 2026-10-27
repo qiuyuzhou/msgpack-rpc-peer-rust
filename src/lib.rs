@@ -7,6 +7,8 @@
 //! have no delivery or completion-order guarantees; [`RpcPeer::notify`] only queues a frame.
 
 mod arguments;
+mod config;
+pub use config::Config;
 mod error;
 mod peer;
 mod registry;

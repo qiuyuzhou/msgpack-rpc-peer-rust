@@ -3,6 +3,12 @@ use crate::Value;
 /// Local failures. Terminal causes are cloned into every outstanding request.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum Error {
+    /// The whole-call deadline expired; remote effects may still occur.
+    #[error("request timed out")]
+    Timeout,
+    /// Startup configuration is invalid.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(&'static str),
     /// The underlying byte stream failed.
     #[error("transport failure: {0}")]
     Transport(String),

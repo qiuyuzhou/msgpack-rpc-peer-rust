@@ -11,11 +11,18 @@ pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + S
 /// Register typed methods before consuming the builder to start a connection.
 #[derive(Default)]
 pub struct PeerBuilder {
+    pub(crate) config: crate::Config,
     pub(crate) methods: HashMap<String, Handler>,
     pub(crate) notifications: HashMap<String, Handler>,
 }
 
 impl PeerBuilder {
+    /// Set limits and deadlines, validated when the connection starts.
+    pub fn config(mut self, config: crate::Config) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Register an asynchronous request handler. `A` is a tuple or sequence of arguments.
     /// Duplicate names are rejected. Handler errors retain their arbitrary wire value.
     pub fn method<A, R, F, Fut>(

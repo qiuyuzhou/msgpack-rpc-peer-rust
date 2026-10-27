@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -17,6 +18,11 @@ use crate::{
 };
 
 const CAPACITY: usize = 64;
+struct Outgoing {
+    bytes: Vec<u8>,
+    request_id: Option<u32>,
+}
+
 type Reply = oneshot::Sender<Result<Value, Error>>;
 
 struct State {
@@ -27,8 +33,9 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
-    outgoing: mpsc::Sender<Vec<u8>>,
+    outgoing: mpsc::Sender<Outgoing>,
     slots: Semaphore,
+    call_timeout: Duration,
 }
 
 impl Shared {
@@ -86,7 +93,10 @@ impl RpcPeer {
         let frame = wire::encode(&(2u8, method, params))?;
         self.shared
             .outgoing
-            .send(frame)
+            .send(Outgoing {
+                bytes: frame,
+                request_id: None,
+            })
             .await
             .map_err(|_| self.shared.terminal())
     }
@@ -95,6 +105,28 @@ impl RpcPeer {
     /// Use `()` for no arguments and `(value,)` for one argument.
     /// Calls wait for bounded capacity; dropping the future releases its pending entry.
     pub async fn request<A: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: A,
+    ) -> Result<R, Error> {
+        self.request_with_timeout(method, args, self.shared.call_timeout)
+            .await
+    }
+
+    /// Override the whole-call deadline, including capacity waits.
+    /// Cancellation is local: a started request may still execute remotely.
+    pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: A,
+        timeout: Duration,
+    ) -> Result<R, Error> {
+        tokio::time::timeout(timeout, self.request_inner(method, args))
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+
+    async fn request_inner<A: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
         args: A,
@@ -127,7 +159,10 @@ impl RpcPeer {
         let frame = wire::encode(&(0u8, id, method, params))?;
         self.shared
             .outgoing
-            .send(frame)
+            .send(Outgoing {
+                bytes: frame,
+                request_id: Some(id),
+            })
             .await
             .map_err(|_| self.shared.terminal())?;
         let value = receiver.await.map_err(|_| self.shared.terminal())??;
@@ -154,6 +189,16 @@ impl HandlerContext {
         args: A,
     ) -> Result<R, Error> {
         self.peer.request(method, args).await
+    }
+
+    /// Override the deadline for a reverse RPC call.
+    pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: A,
+        timeout: Duration,
+    ) -> Result<R, Error> {
+        self.peer.request_with_timeout(method, args, timeout).await
     }
 }
 
@@ -193,6 +238,7 @@ pub(crate) fn start<S>(builder: PeerBuilder, stream: S) -> Result<(RpcPeer, Conn
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    builder.config.validate()?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
     let (outgoing, application) = mpsc::channel(CAPACITY);
     let shared = Arc::new(Shared {
@@ -203,6 +249,7 @@ where
         }),
         outgoing,
         slots: Semaphore::new(CAPACITY),
+        call_timeout: builder.config.default_call_timeout,
     });
     let peer = RpcPeer { shared };
     let (cancel, canceled) = oneshot::channel();
@@ -218,12 +265,16 @@ where
 
 async fn writer<W: AsyncWrite + Unpin>(
     mut writer: W,
-    application: &mut mpsc::Receiver<Vec<u8>>,
+    application: &mut mpsc::Receiver<Outgoing>,
+    shared: &Shared,
     responses: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Error {
     loop {
         let frame = tokio::select! {
-            Some(frame) = application.recv() => frame,
+            Some(frame) = application.recv() => {
+                if frame.request_id.is_some_and(|id| !shared.state.lock().unwrap().pending.contains_key(&id)) { continue; }
+                frame.bytes
+            },
             Some(frame) = responses.recv() => frame,
             else => return Error::Closed,
         };
@@ -251,7 +302,7 @@ async fn run<S>(
     stream: S,
     builder: PeerBuilder,
     peer: RpcPeer,
-    mut application: mpsc::Receiver<Vec<u8>>,
+    mut application: mpsc::Receiver<Outgoing>,
     mut canceled: oneshot::Receiver<()>,
 ) -> Result<(), Error>
 where
@@ -263,7 +314,7 @@ where
     let mut active: HashMap<Id, Option<u32>> = HashMap::new();
     let mut buffer = Vec::new();
     let terminal = {
-        let writing = writer(write_half, &mut application, &mut response_rx);
+        let writing = writer(write_half, &mut application, &peer.shared, &mut response_rx);
         tokio::pin!(writing);
         let terminal = loop {
             tokio::select! {
@@ -323,5 +374,33 @@ where
         Ok(())
     } else {
         Err(terminal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exhausted_ids_fail_without_wrapping() {
+        let (stream, mut raw) = tokio::io::duplex(64);
+        let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
+        peer.shared.state.lock().unwrap().next_id = u32::MAX as u64;
+        let (result, ()) = tokio::join!(
+            peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10)),
+            async {
+                use tokio::io::AsyncReadExt;
+                let mut bytes = [0; 10];
+                raw.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"\x94\x00\xce\xff\xff\xff\xff\xa1x\x90");
+            }
+        );
+        assert_eq!(result, Err(Error::Timeout));
+        assert_eq!(
+            peer.request::<_, ()>("x", ()).await,
+            Err(Error::ResourceLimit("message ID namespace"))
+        );
+        connection.terminate();
+        connection.wait().await.unwrap();
     }
 }

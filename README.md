@@ -169,3 +169,13 @@ cargo run --example duplex
 cargo run --example bidirectional
 cargo run --example nested
 ```
+
+Calls have a 30-second whole-call timeout by default, configurable with
+`Config::default_call_timeout`. `request_with_timeout` overrides it for one call,
+including waits for pending and outgoing queue capacity. Deadlines cannot preempt
+synchronous Serde code or application handlers. Dropping, aborting, or timing out
+a call releases its pending entry; queued calls that have not started writing are
+skipped. A started frame finishes while the connection remains active, so local
+cancellation cannot prevent remote side effects. Late responses are ignored.
+Outgoing IDs increase without reuse; exhaustion returns `Error::ResourceLimit`
+rather than wrapping. `Error::Timeout` does not terminate the connection.
