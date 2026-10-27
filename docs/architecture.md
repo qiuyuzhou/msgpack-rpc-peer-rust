@@ -54,6 +54,6 @@ Queues contain size-limited frames and active decodes obey byte, depth, and node
 
 ## Implementation scope
 
-Keep a single crate with modules for the peer lifecycle, codec, wire messages, registry, transport adapter, and errors as needed. Use Tokio, Serde, rmp-serde, rmpv, and thiserror only where each has a concrete role; add no runtime, networking framework, logging framework, or protocol extension. Resolve the MSRV from the selected dependency versions and check compatibility with the intended initial consumer before documenting it.
+Keep a single crate with modules for the peer lifecycle, codec, wire messages, registry, transport adapter, and errors as needed. Use Tokio, Serde, rmp-serde, rmpv, and thiserror only where each has a concrete role; add no runtime, networking framework, logging framework, or protocol extension. Resolve the MSRV from the language features and selected dependency versions, and verify it by compiling all targets with that toolchain.
 
 Verification includes independent wire fixtures, malformed and fragmented inputs, symmetric and nested calls, queue saturation, cancellation and stale responses, panic isolation, shutdown task ownership, duplex streams, Unix sockets, and a subprocess stdio fixture. Examples demonstrate the same transports and symmetric behavior. Run formatting, warning-free Clippy across all targets and features, the full suite, and every example before reporting implementation complete.

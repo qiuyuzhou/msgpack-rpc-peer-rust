@@ -19,10 +19,6 @@ The declared MSRV is Rust 1.85: edition 2024 and the selected `rmp`, `rmp-serde`
 `rmpv`, and Tokio versions require it. The locked dependency metadata declares no
 higher minimum. Validation used Rust 1.98.1 on macOS; all targets also passed
 `cargo check --locked --all-targets --all-features` with Rust 1.85.0 on macOS.
-As a compiler-policy check,
-the inspected [shadowsocks-rust manifest](https://github.com/shadowsocks/shadowsocks-rust/blob/master/Cargo.toml)
-declares Rust 1.91, above this crate's declared minimum. This checks declared
-compatibility only; no downstream build or application integration was performed.
 
 ## Basic usage
 
@@ -286,7 +282,7 @@ and platform coverage beyond the validation environment remain unverified.
 
 ## Remaining limitations
 
-There is no Swift implementation, application integration, reconnect/retry policy,
+There is no reconnect/retry policy,
 connection pool, runtime ownership, process management, authentication, encryption,
 remote cancellation, shutdown handshake, mutable registry, reliable notification
 delivery, or notification completion ordering. Applications supply transport
