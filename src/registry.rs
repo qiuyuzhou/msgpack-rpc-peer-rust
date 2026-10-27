@@ -17,7 +17,7 @@ pub struct PeerBuilder {
 }
 
 impl PeerBuilder {
-    /// Set resource limits, validated when the connection starts.
+    /// Set limits and deadlines, validated when the connection starts.
     pub fn config(mut self, config: crate::Config) -> Self {
         self.config = config;
         self

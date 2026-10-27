@@ -1,6 +1,10 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -16,7 +20,11 @@ use crate::{
     wire::{self, Message},
 };
 
-const CAPACITY: usize = 64;
+struct Outgoing {
+    bytes: Vec<u8>,
+    request_id: Option<u32>,
+}
+
 type Reply = oneshot::Sender<Result<Value, Error>>;
 
 struct State {
@@ -27,8 +35,9 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
-    outgoing: mpsc::Sender<Vec<u8>>,
+    outgoing: mpsc::Sender<Outgoing>,
     slots: Semaphore,
+    dropped_notifications: AtomicU64,
     config: crate::Config,
 }
 
@@ -69,6 +78,11 @@ pub struct RpcPeer {
 }
 
 impl RpcPeer {
+    /// Number of incoming notifications dropped because the shared handler budget was full.
+    pub fn dropped_notifications(&self) -> u64 {
+        self.shared.dropped_notifications.load(Ordering::Relaxed)
+    }
+
     /// Configure an immutable registry before attaching a stream.
     pub fn builder() -> PeerBuilder {
         PeerBuilder::default()
@@ -90,7 +104,10 @@ impl RpcPeer {
         )?;
         self.shared
             .outgoing
-            .send(frame)
+            .send(Outgoing {
+                bytes: frame,
+                request_id: None,
+            })
             .await
             .map_err(|_| self.shared.terminal())
     }
@@ -99,6 +116,31 @@ impl RpcPeer {
     /// Use `()` for no arguments and `(value,)` for one argument.
     /// Calls wait for bounded capacity; dropping the future releases its pending entry.
     pub async fn request<A: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: A,
+    ) -> Result<R, Error> {
+        self.request_with_timeout(method, args, self.shared.config.default_call_timeout)
+            .await
+    }
+
+    /// Override the whole-call deadline, including capacity waits.
+    /// Cancellation is local: a started request may still execute remotely.
+    pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: A,
+        timeout: Duration,
+    ) -> Result<R, Error> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
+        tokio::time::timeout_at(deadline, self.request_inner(method, args))
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+
+    async fn request_inner<A: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
         args: A,
@@ -134,7 +176,10 @@ impl RpcPeer {
         )?;
         self.shared
             .outgoing
-            .send(frame)
+            .send(Outgoing {
+                bytes: frame,
+                request_id: Some(id),
+            })
             .await
             .map_err(|_| self.shared.terminal())?;
         let value = receiver.await.map_err(|_| self.shared.terminal())??;
@@ -165,6 +210,16 @@ impl HandlerContext {
         args: A,
     ) -> Result<R, Error> {
         self.peer.request(method, args).await
+    }
+
+    /// Override the deadline for a reverse RPC call.
+    pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: A,
+        timeout: Duration,
+    ) -> Result<R, Error> {
+        self.peer.request_with_timeout(method, args, timeout).await
     }
 }
 
@@ -206,7 +261,7 @@ where
 {
     builder.config.validate()?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
-    let (outgoing, application) = mpsc::channel(CAPACITY);
+    let (outgoing, application) = mpsc::channel(builder.config.application_queue_capacity);
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             next_id: 0,
@@ -214,7 +269,8 @@ where
             terminal: None,
         }),
         outgoing,
-        slots: Semaphore::new(CAPACITY),
+        slots: Semaphore::new(builder.config.max_pending_calls),
+        dropped_notifications: AtomicU64::new(0),
         config: builder.config.clone(),
     });
     let peer = RpcPeer { shared };
@@ -231,15 +287,33 @@ where
 
 async fn writer<W: AsyncWrite + Unpin>(
     mut writer: W,
-    application: &mut mpsc::Receiver<Vec<u8>>,
+    application: &mut mpsc::Receiver<Outgoing>,
+    shared: &Shared,
     responses: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Error {
+    let mut prefer_application = true;
     loop {
-        let frame = tokio::select! {
-            Some(frame) = application.recv() => frame,
-            Some(frame) = responses.recv() => frame,
-            else => return Error::Closed,
+        let (frame, application_frame) = if prefer_application {
+            tokio::select! { biased;
+                Some(frame) = application.recv() => (frame, true),
+                Some(bytes) = responses.recv() => (Outgoing { bytes, request_id: None }, false),
+                else => return Error::Closed,
+            }
+        } else {
+            tokio::select! { biased;
+                Some(bytes) = responses.recv() => (Outgoing { bytes, request_id: None }, false),
+                Some(frame) = application.recv() => (frame, true),
+                else => return Error::Closed,
+            }
         };
+        prefer_application = !application_frame;
+        if frame
+            .request_id
+            .is_some_and(|id| !shared.state.lock().unwrap().pending.contains_key(&id))
+        {
+            continue;
+        }
+        let frame = frame.bytes;
         if let Err(e) = writer.write_all(&frame).await {
             return Error::Transport(e.to_string());
         }
@@ -274,19 +348,19 @@ async fn run<S>(
     stream: S,
     builder: PeerBuilder,
     peer: RpcPeer,
-    mut application: mpsc::Receiver<Vec<u8>>,
+    mut application: mpsc::Receiver<Outgoing>,
     mut canceled: oneshot::Receiver<()>,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut reader, write_half) = tokio::io::split(stream);
-    let (responses, mut response_rx) = mpsc::channel(CAPACITY);
+    let (responses, mut response_rx) = mpsc::channel(builder.config.response_queue_capacity);
     let mut handlers = JoinSet::new();
     let mut active: HashMap<Id, Option<u32>> = HashMap::new();
     let mut buffer = wire::Decoder::default();
     let terminal = {
-        let writing = writer(write_half, &mut application, &mut response_rx);
+        let writing = writer(write_half, &mut application, &peer.shared, &mut response_rx);
         tokio::pin!(writing);
         let terminal = loop {
             tokio::select! {
@@ -313,7 +387,7 @@ where
                                 if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method")), builder.config.max_outgoing_bytes) { break error; }
                                 continue;
                             };
-                            if handlers.len() >= CAPACITY {
+                            if handlers.len() >= builder.config.max_handlers {
                                 if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32000, "handler capacity exhausted")), builder.config.max_outgoing_bytes) { break error; }
                                 continue;
                             }
@@ -322,7 +396,10 @@ where
                             active.insert(task.id(), Some(id));
                         }
                         Ok(Message::Notification { method, params }) => {
-                            if handlers.len() >= CAPACITY { continue; }
+                            if handlers.len() >= builder.config.max_handlers {
+                                peer.shared.dropped_notifications.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             if let Some(handler) = builder.notifications.get(&method).cloned() {
                                 let context = HandlerContext { peer: peer.clone() };
                                 let task = handlers.spawn(async move { handler(context, params).await });
@@ -346,5 +423,33 @@ where
         Ok(())
     } else {
         Err(terminal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exhausted_ids_fail_without_wrapping() {
+        let (stream, mut raw) = tokio::io::duplex(64);
+        let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
+        peer.shared.state.lock().unwrap().next_id = u32::MAX as u64;
+        let (result, ()) = tokio::join!(
+            peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10)),
+            async {
+                use tokio::io::AsyncReadExt;
+                let mut bytes = [0; 10];
+                raw.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"\x94\x00\xce\xff\xff\xff\xff\xa1x\x90");
+            }
+        );
+        assert_eq!(result, Err(Error::Timeout));
+        assert_eq!(
+            peer.request::<_, ()>("x", ()).await,
+            Err(Error::ResourceLimit("message ID namespace"))
+        );
+        connection.terminate();
+        connection.wait().await.unwrap();
     }
 }
