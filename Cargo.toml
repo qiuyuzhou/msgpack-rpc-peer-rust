@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Typed MessagePack-RPC between equal Tokio peers"
+license = "MIT"
 
 [dependencies]
 rmp-serde = "1.3"
