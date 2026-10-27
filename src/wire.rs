@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Error, Value};
@@ -193,9 +193,10 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
 ) -> Result<Message, Error> {
     loop {
         if let Some(used) = decoder.boundary(config)? {
+            // rmpv charges twice per container and three times for string/extension leaves.
             let value = rmpv::decode::read_value_with_max_depth(
                 &mut Cursor::new(&decoder.buffer[..used]),
-                config.max_depth + 1,
+                config.max_depth * 2 + 3,
             )
             .map_err(|e| Error::Decode(e.to_string()))?;
             decoder.buffer.drain(..used);
@@ -225,35 +226,7 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
     }
 }
 
-struct LimitedBuffer {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-
-impl std::io::Write for LimitedBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.limit - self.bytes.len() {
-            return Err(std::io::Error::other("message byte limit exceeded"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-pub(crate) fn encode<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<Vec<u8>, Error> {
-    let mut buffer = LimitedBuffer {
-        bytes: Vec::new(),
-        limit,
-    };
-    value
-        .serialize(&mut rmp_serde::Serializer::new(&mut buffer).with_struct_map())
-        .map_err(|_| Error::Encode("value cannot be serialized within message limit".into()))?;
-    Ok(buffer.bytes)
-}
+pub(crate) use crate::encoding::encode;
 
 pub(crate) fn value(bytes: Vec<u8>, config: &crate::Config) -> Result<Value, Error> {
     // Custom serializers can advertise containers without supplying their elements.
@@ -269,8 +242,11 @@ pub(crate) fn value(bytes: Vec<u8>, config: &crate::Config) -> Result<Value, Err
     if used != decoder.buffer.len() {
         return Err(Error::Encode("multiple serialized values".into()));
     }
-    rmpv::decode::read_value_with_max_depth(&mut decoder.buffer.as_slice(), config.max_depth + 1)
-        .map_err(|_| Error::Encode("invalid serialized value".into()))
+    rmpv::decode::read_value_with_max_depth(
+        &mut decoder.buffer.as_slice(),
+        config.max_depth * 2 + 3,
+    )
+    .map_err(|_| Error::Encode("invalid serialized value".into()))
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(value: Value) -> Result<T, Error> {

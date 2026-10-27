@@ -555,3 +555,299 @@ async fn invalid_config_is_rejected_before_spawning_connection_tasks() {
         ));
     }
 }
+
+#[tokio::test]
+async fn exact_incoming_depth_node_and_byte_limits_are_accepted() {
+    use msgpack_rpc_peer::{Config, Value};
+    timeout(Duration::from_secs(3), async {
+        for depth in [3, 64] {
+            for leaf in [b"\xa1x".as_slice(), b"\xd4\x01\x7f".as_slice()] {
+                let mut frame = b"\x94\x00\x00\xa1x\x91".to_vec();
+                frame.extend(std::iter::repeat_n(0x91, depth - 2));
+                frame.extend_from_slice(leaf);
+                let (stream, mut raw) = tokio::io::duplex(128);
+                let (_, owner) = RpcPeer::builder()
+                    .config(Config {
+                        max_depth: depth,
+                        max_nodes: depth + 4,
+                        max_incoming_bytes: frame.len(),
+                        ..Config::default()
+                    })
+                    .method("x", |_, (_value,): (Value,)| async { Ok(42) })
+                    .unwrap()
+                    .start(stream)
+                    .unwrap();
+                raw.write_all(&frame).await.unwrap();
+                let mut reply = [0; 5];
+                raw.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"\x94\x01\x00\xc0\x2a");
+                owner.terminate();
+                owner.wait().await.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+struct UnknownSequence(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Serialize for UnknownSequence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(None)?;
+        for _ in 0..1000 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            seq.serialize_element(&0u8)?;
+        }
+        seq.end()
+    }
+}
+
+#[tokio::test]
+async fn unknown_length_nested_containers_stop_encoding_at_the_byte_limit() {
+    use msgpack_rpc_peer::Config;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let (stream, _raw) = tokio::io::duplex(128);
+    let (peer, owner) = RpcPeer::builder()
+        .config(Config {
+            max_outgoing_bytes: 32,
+            ..Config::default()
+        })
+        .start(stream)
+        .unwrap();
+    let encoded = Arc::new(AtomicUsize::new(0));
+    assert_eq!(
+        peer.notify("x", (UnknownSequence(encoded.clone()),)).await,
+        Err(Error::InvalidParams)
+    );
+    assert!(
+        encoded.load(Ordering::Relaxed) < 32,
+        "encoder must stop before buffering the whole unknown-length sequence"
+    );
+    owner.terminate();
+    owner.wait().await.unwrap();
+}
+
+struct UnknownMap {
+    encoded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    count: usize,
+}
+impl Serialize for UnknownMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        for n in 0..self.count {
+            self.encoded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            map.serialize_entry("n", &n)?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct Flattened {
+    fixed: u32,
+    #[serde(flatten)]
+    extra: UnknownMap,
+}
+
+#[tokio::test]
+async fn flatten_and_nested_unknown_maps_use_the_same_bounded_sink() {
+    use msgpack_rpc_peer::{Config, Value};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    timeout(Duration::from_secs(3), async {
+        let (left, right) = tokio::io::duplex(256);
+        let (peer, owner) = RpcPeer::builder()
+            .config(Config {
+                max_outgoing_bytes: 64,
+                ..Config::default()
+            })
+            .start(left)
+            .unwrap();
+        let (_, remote) = RpcPeer::builder()
+            .config(Config {
+                max_outgoing_bytes: 64,
+                ..Config::default()
+            })
+            .method("echo", |_, (value,): (Value,)| async { Ok(value) })
+            .unwrap()
+            .method("map", |_, (): ()| async {
+                Ok(UnknownMap {
+                    encoded: Arc::default(),
+                    count: 1000,
+                })
+            })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        let encoded = Arc::new(AtomicUsize::new(0));
+        let value: Value = peer
+            .request(
+                "echo",
+                (Flattened {
+                    fixed: 42,
+                    extra: UnknownMap {
+                        encoded: encoded.clone(),
+                        count: 1,
+                    },
+                },),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["fixed"], Value::from(42));
+        assert_eq!(value["n"], Value::from(0));
+        encoded.store(0, Ordering::Relaxed);
+        assert_eq!(
+            peer.notify(
+                "x",
+                (Flattened {
+                    fixed: 42,
+                    extra: UnknownMap {
+                        encoded: encoded.clone(),
+                        count: 1000
+                    }
+                },)
+            )
+            .await,
+            Err(Error::InvalidParams)
+        );
+        assert!(encoded.load(Ordering::Relaxed) < 32);
+        assert!(matches!(
+            peer.request::<_, ()>("map", ()).await,
+            Err(Error::Remote(_))
+        ));
+        let result: u32 = peer.request("echo", (42u32,)).await.unwrap();
+        assert_eq!(result, 42);
+        owner.terminate();
+        owner.wait().await.unwrap();
+        remote.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn bounded_encoding_preserves_enum_binary_and_extension_contracts() {
+    use msgpack_rpc_peer::Value;
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Choice {
+        Unit,
+        Newtype(u32),
+        Tuple(u32, bool),
+        Struct { n: u32 },
+    }
+    timeout(Duration::from_secs(3), async {
+        let (left, right) = tokio::io::duplex(256);
+        let (peer, owner) = RpcPeer::builder().start(left).unwrap();
+        let (_, remote) = RpcPeer::builder()
+            .method("echo", |_, (value,): (Value,)| async { Ok(value) })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        for (choice, expected) in [
+            (Choice::Unit, Value::from("Unit")),
+            (
+                Choice::Newtype(4),
+                Value::Map(vec![("Newtype".into(), 4.into())]),
+            ),
+            (
+                Choice::Tuple(2, true),
+                Value::Map(vec![(
+                    "Tuple".into(),
+                    Value::Array(vec![2.into(), true.into()]),
+                )]),
+            ),
+            (
+                Choice::Struct { n: 9 },
+                Value::Map(vec![(
+                    "Struct".into(),
+                    Value::Map(vec![("n".into(), 9.into())]),
+                )]),
+            ),
+        ] {
+            let result: Value = peer.request("echo", (&choice,)).await.unwrap();
+            assert_eq!(result, expected);
+        }
+        for value in [Value::Binary(vec![0xaa, 0xbb]), Value::Ext(3, vec![0xaa])] {
+            let result: Value = peer.request("echo", (&value,)).await.unwrap();
+            assert_eq!(result, value);
+        }
+        owner.terminate();
+        owner.wait().await.unwrap();
+        remote.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn complete_outgoing_envelopes_accept_the_exact_byte_limit() {
+    use msgpack_rpc_peer::Config;
+    timeout(Duration::from_secs(3), async {
+        let (stream, mut raw) = tokio::io::duplex(64);
+        let (peer, owner) = RpcPeer::builder()
+            .config(Config {
+                max_outgoing_bytes: 5,
+                ..Config::default()
+            })
+            .start(stream)
+            .unwrap();
+        peer.notify("x", ()).await.unwrap();
+        assert!(matches!(peer.notify("xx", ()).await, Err(Error::Encode(_))));
+        let mut frame = [0; 5];
+        raw.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, b"\x93\x02\xa1x\x90");
+        owner.terminate();
+        owner.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+struct FormattedValue(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl std::fmt::Display for FormattedValue {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for _ in 0..1000 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            output.write_str("x")?;
+        }
+        Ok(())
+    }
+}
+impl Serialize for FormattedValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+#[tokio::test]
+async fn formatted_strings_stop_at_the_byte_limit_without_a_temporary_string() {
+    use msgpack_rpc_peer::Config;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let (stream, _raw) = tokio::io::duplex(128);
+    let (peer, owner) = RpcPeer::builder()
+        .config(Config {
+            max_outgoing_bytes: 32,
+            ..Config::default()
+        })
+        .start(stream)
+        .unwrap();
+    let encoded = Arc::new(AtomicUsize::new(0));
+    assert_eq!(
+        peer.notify("x", (FormattedValue(encoded.clone()),)).await,
+        Err(Error::InvalidParams)
+    );
+    assert!(encoded.load(Ordering::Relaxed) < 32);
+    owner.terminate();
+    owner.wait().await.unwrap();
+}
