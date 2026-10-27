@@ -11,7 +11,9 @@ mod config;
 mod error;
 mod peer;
 mod registry;
+mod transport;
 mod wire;
+pub use transport::SplitIo;
 
 pub use config::Config;
 pub use error::{Error, RemoteError};
