@@ -29,6 +29,7 @@ struct Shared {
     state: Mutex<State>,
     outgoing: mpsc::Sender<Vec<u8>>,
     slots: Semaphore,
+    config: crate::Config,
 }
 
 impl Shared {
@@ -80,10 +81,13 @@ impl RpcPeer {
         if let Some(error) = &self.shared.state.lock().unwrap().terminal {
             return Err(error.clone());
         }
-        let args = wire::encode(&Arguments(args)).map_err(|_| Error::InvalidParams)?;
-        let params =
-            rmpv::decode::read_value(&mut args.as_slice()).map_err(|_| Error::InvalidParams)?;
-        let frame = wire::encode(&(2u8, method, params))?;
+        let args = wire::encode(&Arguments(args), self.shared.config.max_outgoing_bytes)
+            .map_err(|_| Error::InvalidParams)?;
+        let params = wire::value(args, &self.shared.config).map_err(|_| Error::InvalidParams)?;
+        let frame = wire::encode(
+            &(2u8, method, params),
+            self.shared.config.max_outgoing_bytes,
+        )?;
         self.shared
             .outgoing
             .send(frame)
@@ -121,10 +125,13 @@ impl RpcPeer {
             shared: self.shared.clone(),
             id,
         };
-        let args = wire::encode(&Arguments(args)).map_err(|_| Error::InvalidParams)?;
-        let params =
-            rmpv::decode::read_value(&mut args.as_slice()).map_err(|_| Error::InvalidParams)?;
-        let frame = wire::encode(&(0u8, id, method, params))?;
+        let args = wire::encode(&Arguments(args), self.shared.config.max_outgoing_bytes)
+            .map_err(|_| Error::InvalidParams)?;
+        let params = wire::value(args, &self.shared.config).map_err(|_| Error::InvalidParams)?;
+        let frame = wire::encode(
+            &(0u8, id, method, params),
+            self.shared.config.max_outgoing_bytes,
+        )?;
         self.shared
             .outgoing
             .send(frame)
@@ -142,6 +149,10 @@ pub struct HandlerContext {
 }
 
 impl HandlerContext {
+    pub(crate) fn config(&self) -> &crate::Config {
+        &self.peer.shared.config
+    }
+
     /// Queue a notification while incoming messages continue to be processed.
     pub async fn notify<A: Serialize>(&self, method: &str, args: A) -> Result<(), Error> {
         self.peer.notify(method, args).await
@@ -193,6 +204,7 @@ pub(crate) fn start<S>(builder: PeerBuilder, stream: S) -> Result<(RpcPeer, Conn
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    builder.config.validate()?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
     let (outgoing, application) = mpsc::channel(CAPACITY);
     let shared = Arc::new(Shared {
@@ -203,6 +215,7 @@ where
         }),
         outgoing,
         slots: Semaphore::new(CAPACITY),
+        config: builder.config.clone(),
     });
     let peer = RpcPeer { shared };
     let (cancel, canceled) = oneshot::channel();
@@ -240,8 +253,18 @@ fn respond(
     responses: &mpsc::Sender<Vec<u8>>,
     id: u32,
     outcome: Result<Value, RemoteError>,
+    limit: usize,
 ) -> Result<(), Error> {
-    let frame = wire::response(id, outcome)?;
+    let frame = wire::response(id, outcome, limit).or_else(|_| {
+        wire::response(
+            id,
+            Err(RemoteError::builtin(
+                -32603,
+                "response serialization failed",
+            )),
+            limit,
+        )
+    })?;
     responses
         .try_send(frame)
         .map_err(|_| Error::ResourceLimit("response queue"))
@@ -261,7 +284,7 @@ where
     let (responses, mut response_rx) = mpsc::channel(CAPACITY);
     let mut handlers = JoinSet::new();
     let mut active: HashMap<Id, Option<u32>> = HashMap::new();
-    let mut buffer = Vec::new();
+    let mut buffer = wire::Decoder::default();
     let terminal = {
         let writing = writer(write_half, &mut application, &mut response_rx);
         tokio::pin!(writing);
@@ -275,10 +298,10 @@ where
                         Err(error) => (error.id(), Err(RemoteError::builtin(-32603, "handler failed"))),
                     };
                     if let Some(id) = active.remove(&task_id).unwrap() {
-                        if let Err(error) = respond(&responses, id, outcome) { break error; }
+                        if let Err(error) = respond(&responses, id, outcome, builder.config.max_outgoing_bytes) { break error; }
                     }
                 }
-                message = wire::read(&mut reader, &mut buffer) => {
+                message = wire::read(&mut reader, &mut buffer, &builder.config) => {
                     match message {
                         Err(error) => break error,
                         Ok(Message::Response { id, outcome }) => {
@@ -287,11 +310,11 @@ where
                         Ok(Message::Request { id, method, params }) => {
                             if active.values().any(|active_id| *active_id == Some(id)) { break Error::Protocol("duplicate active request ID"); }
                             let Some(handler) = builder.methods.get(&method).cloned() else {
-                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method"))) { break error; }
+                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32601, "unknown method")), builder.config.max_outgoing_bytes) { break error; }
                                 continue;
                             };
                             if handlers.len() >= CAPACITY {
-                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32000, "handler capacity exhausted"))) { break error; }
+                                if let Err(error) = respond(&responses, id, Err(RemoteError::builtin(-32000, "handler capacity exhausted")), builder.config.max_outgoing_bytes) { break error; }
                                 continue;
                             }
                             let context = HandlerContext { peer: peer.clone() };

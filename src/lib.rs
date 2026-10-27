@@ -7,11 +7,13 @@
 //! have no delivery or completion-order guarantees; [`RpcPeer::notify`] only queues a frame.
 
 mod arguments;
+mod config;
 mod error;
 mod peer;
 mod registry;
 mod wire;
 
+pub use config::Config;
 pub use error::{Error, RemoteError};
 pub use peer::{Connection, HandlerContext, RpcPeer};
 pub use registry::PeerBuilder;

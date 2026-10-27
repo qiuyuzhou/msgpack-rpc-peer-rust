@@ -275,3 +275,283 @@ async fn notification_failures_never_reply_or_close_the_connection() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn hostile_advertised_lengths_are_rejected_without_waiting_for_payload() {
+    timeout(Duration::from_secs(3), async {
+        for frame in [
+            b"\xdd\xff\xff\xff\xff".as_slice(),
+            b"\xdf\xff\xff\xff\xff".as_slice(),
+            b"\xdb\xff\xff\xff\xff".as_slice(),
+            b"\xc6\xff\xff\xff\xff".as_slice(),
+            b"\xc9\xff\xff\xff\xff".as_slice(),
+        ] {
+            let (stream, mut raw) = tokio::io::duplex(128);
+            let (_, connection) = RpcPeer::builder().start(stream).unwrap();
+            raw.write_all(frame).await.unwrap();
+            assert!(matches!(
+                connection.wait().await,
+                Err(Error::ResourceLimit(_))
+            ));
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn configured_wire_budgets_are_enforced_and_outgoing_rejection_keeps_stream_usable() {
+    use msgpack_rpc_peer::Config;
+    timeout(Duration::from_secs(3), async {
+        let config = Config {
+            max_incoming_bytes: 64,
+            max_outgoing_bytes: 64,
+            max_depth: 4,
+            max_nodes: 12,
+            ..Config::default()
+        };
+        for (frame, resource) in [
+            (
+                b"\x94\x00\x00\xa1x\x91\x91\x91\x90".as_slice(),
+                "MessagePack nesting depth",
+            ),
+            (b"\x94\x00\x00\xa1x\x99".as_slice(), "decoded value nodes"),
+            (
+                b"\x94\x00\x00\xa1x\x91\xd9\x40".as_slice(),
+                "incoming message bytes",
+            ),
+        ] {
+            let (stream, mut raw) = tokio::io::duplex(128);
+            let (_, connection) = RpcPeer::builder()
+                .config(config.clone())
+                .start(stream)
+                .unwrap();
+            raw.write_all(frame).await.unwrap();
+            assert_eq!(connection.wait().await, Err(Error::ResourceLimit(resource)));
+        }
+        let (stream, mut raw) = tokio::io::duplex(128);
+        let (peer, connection) = RpcPeer::builder().config(config).start(stream).unwrap();
+        assert!(peer.notify(&"x".repeat(64), ()).await.is_err());
+        assert!(peer.request::<_, ()>("x", ("x".repeat(64),)).await.is_err());
+        peer.notify("x", ()).await.unwrap();
+        let mut frame = [0; 5];
+        raw.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, *b"\x93\x02\xa1x\x90");
+        connection.terminate();
+        connection.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn every_fragment_boundary_and_concatenated_objects_keep_standard_framing() {
+    timeout(Duration::from_secs(3), async {
+        let fixture = b"\x94\x00\xce\xff\xff\xff\xff\xa3inc\x91\xcc\xff";
+        for boundary in 1..fixture.len() {
+            let (stream, mut raw) = tokio::io::duplex(128);
+            let (_, connection) = RpcPeer::builder()
+                .method("inc", |_, (n,): (u32,)| async move { Ok(n + 1) })
+                .unwrap()
+                .start(stream)
+                .unwrap();
+            raw.write_all(&fixture[..boundary]).await.unwrap();
+            tokio::task::yield_now().await;
+            raw.write_all(&fixture[boundary..]).await.unwrap();
+            raw.write_all(b"\x94\x00\x00\xa3inc\x91\x00").await.unwrap();
+            let mut actual = [0; 16];
+            raw.read_exact(&mut actual).await.unwrap();
+            // Handlers are unordered; independently decode the two responses.
+            let mut bytes = actual.as_slice();
+            let mut responses = [
+                rmpv::decode::read_value(&mut bytes).unwrap(),
+                rmpv::decode::read_value(&mut bytes).unwrap(),
+            ];
+            responses.sort_by_key(|v| v[1].as_u64());
+            assert_eq!(
+                responses[0],
+                rmpv::Value::Array(vec![1.into(), 0.into(), rmpv::Value::Nil, 1.into()])
+            );
+            assert_eq!(
+                responses[1],
+                rmpv::Value::Array(vec![
+                    1.into(),
+                    u32::MAX.into(),
+                    rmpv::Value::Nil,
+                    256.into()
+                ])
+            );
+            connection.terminate();
+            connection.wait().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_wire_and_truncated_eof_preserve_terminal_categories_for_pending_calls() {
+    timeout(Duration::from_secs(3), async {
+        for frame in [
+            b"\xc1".as_slice(),
+            b"\x94\x00".as_slice(),
+            b"\x94\x00\x00\xa1x\x91\xda\x00".as_slice(),
+            b"\x94\x00\xff\xa1x\x90".as_slice(),
+            b"\x94\x00\xcf\x00\x00\x00\x01\x00\x00\x00\x00\xa1x\x90".as_slice(),
+            b"\x94\x00\xcb\x00\x00\x00\x00\x00\x00\x00\x00\xa1x\x90".as_slice(),
+            b"\x94\x03\x00\xc0\xc0".as_slice(),
+            b"\x94\x01\x00\x01\x02".as_slice(),
+            b"\x94\x00\x00\x00\x90".as_slice(),
+            b"\x94\x00\x00\xa1x\x80".as_slice(),
+            b"\x94\xca\x00\x00\x00\x00\x00\xa1x\x90".as_slice(),
+        ] {
+            let (stream, mut raw) = tokio::io::duplex(128);
+            let (peer, connection) = RpcPeer::builder().start(stream).unwrap();
+            let call = peer.request::<_, ()>("x", ());
+            let remote = async {
+                let mut request = [0; 6];
+                raw.read_exact(&mut request).await.unwrap();
+                raw.write_all(frame).await.unwrap();
+                raw.shutdown().await.unwrap();
+            };
+            let (result, ()) = tokio::join!(call, remote);
+            let terminal = connection.wait().await;
+            assert!(matches!(
+                &terminal,
+                Err(Error::Decode(_) | Error::Protocol(_))
+            ));
+            assert_eq!(result, terminal);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+struct BrokenValue;
+impl Serialize for BrokenValue {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom(
+            "sensitive custom serializer failure",
+        ))
+    }
+}
+
+struct AdvertisedHugeArray;
+impl Serialize for AdvertisedHugeArray {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        serializer.serialize_seq(Some(u32::MAX as usize))?.end()
+    }
+}
+
+#[tokio::test]
+async fn rejected_results_errors_and_custom_serializers_leave_a_usable_connection() {
+    use msgpack_rpc_peer::{Config, RemoteError, Value};
+    timeout(Duration::from_secs(3), async {
+        let (left, right) = tokio::io::duplex(256);
+        let (peer, owner) = RpcPeer::builder().start(left).unwrap();
+        let (_, remote) = RpcPeer::builder()
+            .config(Config {
+                max_outgoing_bytes: 96,
+                ..Config::default()
+            })
+            .method("large", |_, (): ()| async { Ok("x".repeat(96)) })
+            .unwrap()
+            .method("error", |_, (): ()| async {
+                Err::<(), _>(RemoteError::new(Value::from("x".repeat(96))).unwrap())
+            })
+            .unwrap()
+            .method("broken", |_, (): ()| async { Ok(BrokenValue) })
+            .unwrap()
+            .method("advertised", |_, (): ()| async { Ok(AdvertisedHugeArray) })
+            .unwrap()
+            .method("ok", |_, (): ()| async { Ok(42u32) })
+            .unwrap()
+            .start(right)
+            .unwrap();
+        for method in ["large", "error", "broken", "advertised"] {
+            let error = peer.request::<_, ()>(method, ()).await.unwrap_err();
+            let Error::Remote(value) = error else {
+                panic!("expected remote failure");
+            };
+            assert_eq!(value["code"], Value::from(-32603));
+            assert!(!format!("{value:?}").contains("sensitive"));
+            assert_eq!(peer.request::<_, u32>("ok", ()).await.unwrap(), 42);
+        }
+        assert_eq!(
+            peer.notify("ok", (BrokenValue,)).await,
+            Err(Error::InvalidParams)
+        );
+        assert_eq!(peer.request::<_, u32>("ok", ()).await.unwrap(), 42);
+        owner.terminate();
+        owner.wait().await.unwrap();
+        remote.wait().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn response_that_cannot_fit_even_a_generic_error_terminates_explicitly() {
+    use msgpack_rpc_peer::Config;
+    timeout(Duration::from_secs(3), async {
+        let (stream, mut raw) = tokio::io::duplex(128);
+        let (_, owner) = RpcPeer::builder()
+            .config(Config {
+                max_outgoing_bytes: 5,
+                ..Config::default()
+            })
+            .method("x", |_, (): ()| async { Ok("too long") })
+            .unwrap()
+            .start(stream)
+            .unwrap();
+        raw.write_all(b"\x94\x00\x00\xa1x\x90").await.unwrap();
+        assert!(matches!(owner.wait().await, Err(Error::Encode(_))));
+        let mut bytes = Vec::new();
+        raw.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            bytes.is_empty(),
+            "rejected frame must not emit partial bytes"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_config_is_rejected_before_spawning_connection_tasks() {
+    use msgpack_rpc_peer::Config;
+    let invalid = [
+        Config {
+            max_incoming_bytes: 0,
+            ..Config::default()
+        },
+        Config {
+            max_outgoing_bytes: 0,
+            ..Config::default()
+        },
+        Config {
+            max_depth: 0,
+            ..Config::default()
+        },
+        Config {
+            max_depth: 1025,
+            ..Config::default()
+        },
+        Config {
+            max_nodes: 0,
+            ..Config::default()
+        },
+        Config {
+            default_call_timeout: Duration::ZERO,
+            ..Config::default()
+        },
+    ];
+    for config in invalid {
+        let (stream, _) = tokio::io::duplex(128);
+        assert!(matches!(
+            RpcPeer::builder().config(config).start(stream),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+}
