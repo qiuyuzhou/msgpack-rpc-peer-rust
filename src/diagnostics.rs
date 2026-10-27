@@ -4,10 +4,16 @@ use std::sync::{
 };
 use tokio::sync::mpsc;
 
-/// Maximum number of events buffered when observation is enabled.
+/// Maximum number of events buffered when observation is enabled. A full or
+/// dropped receiver increments `lost_events`.
 pub const DIAGNOSTIC_EVENT_CAPACITY: usize = 64;
 
-/// A fixed diagnostic category. Events contain no application-controlled values.
+/// A fixed diagnostic category. Events contain no application-controlled
+/// values: no parameters, remote method names, or panic payloads.
+///
+/// These events also do not cover application logging, application-provided
+/// remote errors, custom serializer errors, or the process panic hook, which
+/// runs before a panic is caught.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticEvent {
     /// A request or notification handler panicked under unwinding.
@@ -18,8 +24,10 @@ pub enum DiagnosticEvent {
     NotificationDropped,
 }
 
-/// Fixed counters available even when event observation is disabled.
-/// Each counter is read independently; concurrent updates may occur during a snapshot.
+/// Fixed counters available even when event observation is disabled. Read
+/// them with [`RpcPeer::diagnostics`](crate::RpcPeer::diagnostics); snapshots
+/// read counters independently, so concurrent updates may occur during a
+/// snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiagnosticsSnapshot {
     /// Request and notification handler panics.
@@ -33,6 +41,14 @@ pub struct DiagnosticsSnapshot {
 }
 
 /// Optional bounded event receiver. Keeping it does not keep the connection alive.
+///
+/// Enable observation with
+/// [`PeerBuilder::diagnostic_events`](crate::PeerBuilder::diagnostic_events)
+/// before startup and take the stream once with
+/// [`Connection::take_events`](crate::Connection::take_events). Disabled
+/// observation loses no events, and producers never wait for consumers or
+/// spawn extra tasks. The stream closes when the connection terminates, even
+/// if handles survive.
 pub struct DiagnosticEvents(pub(crate) mpsc::Receiver<DiagnosticEvent>);
 impl DiagnosticEvents {
     /// Wait for the next event, or `None` once connection cleanup closes the stream.

@@ -7,8 +7,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Pair independently owned asynchronous read and write handles.
 ///
-/// For subprocess RPC, pass the child's stdout as `reader` and stdin as `writer`.
-/// This adapter owns only those handles; the application retains process ownership.
+/// [`PeerBuilder::start`](crate::PeerBuilder::start) accepts any owned
+/// `AsyncRead + AsyncWrite + Unpin + Send + 'static` stream; Unix sockets use
+/// the same API on supported platforms. For subprocess RPC, pass the child's
+/// stdout as `reader` and stdin as `writer`. This adapter owns only those
+/// handles: the application retains process ownership. Reserve subprocess
+/// stdout for RPC bytes and send diagnostics to stderr.
 #[derive(Debug)]
 pub struct SplitIo<R, W> {
     reader: R,

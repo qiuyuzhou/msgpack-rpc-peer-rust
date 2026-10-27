@@ -1,6 +1,13 @@
 use crate::Value;
 
 /// Local failures. Terminal causes are cloned into every outstanding request.
+///
+/// Valid unknown methods and invalid typed arguments produce remote failures
+/// and leave the connection usable, and so does [`Error::Timeout`].
+/// [`Error::Remote`] preserves an arbitrary non-nil remote failure without
+/// assuming a schema. Malformed envelopes, duplicate active incoming IDs,
+/// invalid MessagePack, truncated EOF, and fatal wire resource violations
+/// terminate the connection and resolve pending calls.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum Error {
     /// New application work is refused during graceful shutdown.
@@ -51,6 +58,22 @@ pub enum Error {
 }
 
 /// A method failure sent to the remote peer. Its value is always non-nil.
+///
+/// Library-generated failures are maps with `code` and `message` fields.
+/// These codes are library conventions, not MessagePack-RPC standard codes:
+///
+/// | Code | Message | Trigger |
+/// | --- | --- | --- |
+/// | -32601 | `unknown method` | No registered request method |
+/// | -32602 | `invalid parameters` | Typed argument decoding failed |
+/// | -32603 | `handler failed` | Request handler panic under unwinding |
+/// | -32603 | `result serialization failed` | Result encoding or conversion failed |
+/// | -32603 | `response serialization failed` | Complete response needed a fallback |
+/// | -32000 | `handler capacity exhausted` | Shared handler budget exhausted |
+///
+/// Notification errors and panics have no response. Under panic unwinding,
+/// handler invocation and future execution are isolated in supervised tasks;
+/// panic-abort builds cannot recover from panics.
 #[derive(Clone, Debug)]
 pub struct RemoteError(Value);
 

@@ -137,6 +137,13 @@ impl Drop for HandlerLease {
 }
 
 /// Cloneable outgoing capabilities. Keeping a handle does not keep a connection alive.
+///
+/// Requests and notifications can be issued concurrently, and responses are
+/// correlated by message ID. Both endpoints count outgoing IDs in independent
+/// namespaces, so opposite requests with the same numeric ID do not collide.
+/// Outgoing u32 IDs increase without reuse, even after cancellation;
+/// exhaustion returns [`Error::ResourceLimit`] with a `message ID namespace`
+/// payload instead of wrapping.
 #[derive(Clone)]
 pub struct RpcPeer {
     shared: Arc<Shared>,
@@ -159,8 +166,13 @@ impl RpcPeer {
     }
 
     /// Queue a one-way notification with an explicit argument list.
-    /// Success means queued locally, without acknowledgment of delivery or execution.
-    /// Waits for bounded outgoing capacity; consumes no request ID or pending-call slot.
+    ///
+    /// A successful await means the notification is queued locally; it does
+    /// not confirm remote delivery, execution, or success. Notifications
+    /// consume no request ID or pending-call slot and never receive responses.
+    /// The remote peer ignores unknown notification names, and invalid typed
+    /// arguments and other notification failures are counted in its own
+    /// diagnostics. Waits for bounded outgoing capacity.
     pub async fn notify<A: Serialize>(&self, method: &str, args: A) -> Result<(), Error> {
         self.notify_inner(method, args, None).await
     }
@@ -187,9 +199,26 @@ impl RpcPeer {
     }
 
     /// Send an explicit argument list and decode a typed result.
-    /// Use `()` for no arguments and `(value,)` for one argument.
-    /// The configured whole-call timeout includes capacity and response waits.
-    /// Dropping the future releases its pending entry; started writes may still execute remotely.
+    ///
+    /// Arguments are tuples or sequences: `()` for none, `(value,)` for one,
+    /// and `(first, second)` for two. Top-level scalars, maps, structs, and
+    /// nil are rejected as [`Error::InvalidParams`]. A structured argument
+    /// goes inside the list as `(MyArguments { ... },)` and encodes with named
+    /// fields. The result can be any supported Serde value; use [`Value`] for
+    /// arbitrary MessagePack data.
+    ///
+    /// The call uses [`Config::default_call_timeout`](crate::Config::default_call_timeout)
+    /// (30 seconds by default) as a whole-call deadline. The deadline includes
+    /// pending-slot and outgoing-queue waits, serialization, and response
+    /// waiting. Synchronous Serde code and handler code cannot be preempted by
+    /// an asynchronous deadline.
+    ///
+    /// Dropping, aborting, or timing out the call removes its pending entry
+    /// and releases capacity. A call canceled before its frame starts writing
+    /// is skipped; a started frame finishes while the connection remains
+    /// active, preserving framing, so local cancellation cannot prevent remote
+    /// side effects. Late and unmatched responses are discarded.
+    /// [`Error::Timeout`] leaves the connection usable.
     pub async fn request<A: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
@@ -200,7 +229,10 @@ impl RpcPeer {
     }
 
     /// Override the whole-call deadline, including capacity waits.
+    ///
+    /// The deadline cannot preempt synchronous Serde code or handler code.
     /// Cancellation is local: a started request may still execute remotely.
+    /// [`Error::Timeout`] leaves the connection usable.
     pub async fn request_with_timeout<A: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
@@ -240,8 +272,14 @@ impl RpcPeer {
 }
 
 /// Capabilities supplied to a method handler, including reverse RPC requests.
-/// Active handlers may initiate work during graceful draining. That privilege expires
-/// when their handler finishes, even if a cloned context survives.
+///
+/// [`Self::request`] and [`Self::notify`] initiate reverse operations while
+/// the receive loop continues processing responses. Requests and
+/// notifications share a bounded concurrent handler budget, and handlers can
+/// finish out of arrival order.
+///
+/// Active handlers may initiate work during graceful draining. That privilege
+/// expires when their handler finishes, even if a cloned context survives.
 #[derive(Clone)]
 pub struct HandlerContext {
     peer: RpcPeer,
@@ -290,7 +328,13 @@ impl HandlerContext {
 }
 
 /// Sole lifecycle owner of a connection and all its background work.
-/// Drop initiates cancellation. Use [`Self::wait`] to observe completed cleanup.
+///
+/// Dropping the owner initiates cancellation, even if peer handles or handler
+/// contexts survive. A destructor cannot synchronously join tasks, and
+/// canceling a [`Self::wait`] or shutdown future also drops the owner and
+/// cancels. The supervisor owns the read and single-writer futures and a
+/// bounded set of handler tasks; internal locks do not span asynchronous
+/// waits.
 #[must_use = "dropping the connection cancels transport and handlers"]
 pub struct Connection {
     shared: Arc<Shared>,
@@ -300,14 +344,29 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Stop new application work and drain accepted work within the configured deadline.
-    /// Handler reverse calls remain admissible until their handler finishes.
+    /// Stop new application work and drain accepted work within the
+    /// configured five-second deadline.
+    ///
+    /// New application calls and notifications return [`Error::Draining`],
+    /// while operations already admitted, including capacity waiters, may
+    /// finish. Active handlers retain reverse-call admission; cloned contexts
+    /// lose it when their handler ends. Incoming work stays admissible within
+    /// the same bounds, because standard messages cannot identify reverse
+    /// calls. Sustained traffic never extends the fixed deadline.
+    ///
+    /// Successful draining waits for admitted operations, handlers, queued
+    /// frames, and in-flight writes. At the deadline, remaining work is
+    /// canceled and joined, and the owner and pending calls receive
+    /// [`Error::ShutdownTimeout`].
     pub async fn shutdown(self) -> Result<(), Error> {
         let timeout = self.shared.config.graceful_shutdown_timeout;
         self.shutdown_with_timeout(timeout).await
     }
 
-    /// Drain using a fixed deadline override. Expiration cancels and joins remaining tasks.
+    /// Drain using a fixed deadline override instead of the configured
+    /// [`Config::graceful_shutdown_timeout`](crate::Config::graceful_shutdown_timeout).
+    /// Expiration cancels and joins remaining tasks. Semantics match
+    /// [`Self::shutdown`].
     pub async fn shutdown_with_timeout(self, timeout: Duration) -> Result<(), Error> {
         let deadline =
             tokio::time::Instant::now()
@@ -323,7 +382,8 @@ impl Connection {
         self.wait().await
     }
 
-    /// Take the optional event stream once. Enable it on the builder before startup.
+    /// Take the optional event stream once. Enable it on the builder before
+    /// startup with [`PeerBuilder::diagnostic_events`](crate::PeerBuilder::diagnostic_events).
     pub fn take_events(&mut self) -> Option<DiagnosticEvents> {
         self.events.take()
     }
@@ -336,7 +396,11 @@ impl Connection {
     }
 
     /// Wait for transport closure and all supervised handler tasks to terminate.
-    /// Local termination and clean EOF complete successfully; failures preserve a cause.
+    ///
+    /// Local termination and clean EOF complete the owner successfully, and
+    /// outstanding calls fail with [`Error::Closed`]. Malformed traffic,
+    /// resource violations, and I/O failures keep their terminal cause, so EOF
+    /// can end a drain before all accepted work succeeds.
     pub async fn wait(mut self) -> Result<(), Error> {
         // Borrow until completion so canceling wait still drops the lifecycle owner.
         let result = self.task.as_mut().unwrap().await;

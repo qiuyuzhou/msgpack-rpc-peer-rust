@@ -8,7 +8,14 @@ use crate::{Connection, Error, HandlerContext, RemoteError, RpcParams, RpcPeer, 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send>>;
 pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + Send + Sync>;
 
-/// Register typed methods before consuming the builder to start a connection.
+/// Register typed asynchronous methods and notifications before consuming the
+/// builder to start a connection.
+///
+/// Duplicate names fail with [`Error::DuplicateMethod`], and request and
+/// notification names have separate registries. [`Self::start`] consumes the
+/// builder, validates the configuration, and requires the current Tokio
+/// runtime. It returns a cloneable [`RpcPeer`] and a separate [`Connection`]
+/// owner; keep the owner alive while you use the peer.
 #[derive(Default)]
 pub struct PeerBuilder {
     pub(crate) diagnostic_events: bool,
@@ -31,8 +38,14 @@ impl PeerBuilder {
         self
     }
 
-    /// Register an asynchronous request handler. `P` is an [`RpcParams`] argument list.
-    /// Duplicate names are rejected. Handler errors retain their arbitrary wire value.
+    /// Register an asynchronous request handler with a typed argument list.
+    ///
+    /// `P` is an [`RpcParams`] argument list, checked at compile time. The
+    /// handler returns `Result<R, RemoteError>`, and results can be any
+    /// supported Serde value. Incoming values and argument counts are still
+    /// validated at runtime. Handler errors retain their arbitrary wire
+    /// value; build one with [`RemoteError::new`]. Duplicate names are
+    /// rejected.
     pub fn method<P, R, F, Fut>(
         mut self,
         name: impl Into<String>,
@@ -52,10 +65,13 @@ impl PeerBuilder {
         Ok(self)
     }
 
-    /// Register a typed asynchronous notification handler returning `Result<(), RemoteError>`.
-    /// `P` is an [`RpcParams`] argument list.
-    /// Notification names are independent of request method names; duplicates are rejected.
-    /// Handlers execute concurrently, without completion-order or delivery guarantees.
+    /// Register a typed asynchronous notification handler returning
+    /// `Result<(), RemoteError>`.
+    ///
+    /// `P` is an [`RpcParams`] argument list, checked at compile time.
+    /// Handlers execute concurrently, without completion-order or delivery
+    /// guarantees. Notification names are independent of request method
+    /// names; duplicates are rejected.
     pub fn notification<P, F, Fut>(
         mut self,
         name: impl Into<String>,
@@ -75,7 +91,10 @@ impl PeerBuilder {
     }
 
     /// Attach an already-established stream using the current Tokio runtime.
-    /// The returned connection owner must be retained for the connection to stay alive.
+    ///
+    /// Accepts any owned `AsyncRead + AsyncWrite + Unpin + Send + 'static`
+    /// stream. The returned connection owner must be retained for the
+    /// connection to stay alive.
     pub fn start<S>(self, stream: S) -> Result<(RpcPeer, Connection), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
