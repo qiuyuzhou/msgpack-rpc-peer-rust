@@ -251,3 +251,36 @@ async fn a_remote_peer_can_reuse_an_id_after_its_response_is_written_and_flushed
     .await
     .unwrap();
 }
+
+#[cfg(panic = "unwind")]
+#[tokio::test]
+async fn panicked_request_ids_remain_active_until_error_response_flush_completes() {
+    timeout(Duration::from_secs(3), async {
+        let (stream, mut raw) = tokio::io::duplex(256);
+        let control = FlushControl::new(false);
+        let (peer, connection) = RpcPeer::builder()
+            .method(
+                "x",
+                |_, (): ()| -> std::future::Ready<Result<(), msgpack_rpc_peer::RemoteError>> {
+                    panic!("handler failed");
+                },
+            )
+            .unwrap()
+            .start(ControlledFlush {
+                stream,
+                control: control.clone(),
+            })
+            .unwrap();
+        let pending = pending_call(&peer, &mut raw).await;
+        control.completed.notified().await;
+        control
+            .held
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        raw.write_all(b"\x94\x00\x2a\xa1x\x90").await.unwrap();
+        control.entered.notified().await;
+        raw.write_all(b"\x94\x00\x2a\xa1x\x90").await.unwrap();
+        duplicate_failure(connection, pending).await;
+    })
+    .await
+    .unwrap();
+}

@@ -22,6 +22,8 @@ Request and notification handlers share one concurrency budget. Excess requests 
 
 Pending outgoing calls are bounded and correlated by unsigned 32-bit IDs that are never reused on the same connection. Cancellation removes the pending entry; late and otherwise unmatched responses are discarded. Incoming IDs belong to the other peer's independent namespace. Duplicate active incoming IDs terminate the connection.
 
+A private incoming request module owns incoming ID registration and response queuing. Admission returns an ID-owning credential; submitting a response consumes it and transfers ownership to the queued frame until writing and flushing complete, or connection termination discards the frame.
+
 ## Failure and shutdown
 
 Typed local errors distinguish transport, decode, protocol, timeout, closure, resource exhaustion, invalid parameters, unknown method, and remote method failures. Arbitrary remote error values are preserved. Built-in remote errors use library-defined `code` and `message` fields; they are not protocol-standard codes. Default diagnostics omit parameters and application panic payloads.
