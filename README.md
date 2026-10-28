@@ -48,7 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Build a `PeerBuilder` with typed methods and notifications, then `start` it on a
 stream. `start` returns a cloneable `RpcPeer` and a separate `Connection` owner
-that supervises the connection.
+that supervises the connection. The builder is reusable: call `start` once per
+connection to reuse the registered handlers, for example in an accept loop.
 
 The API documentation, built with `cargo doc --open`, covers argument
 conventions, timeouts and cancellation, the connection lifecycle, configuration

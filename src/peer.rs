@@ -437,7 +437,7 @@ impl Drop for Connection {
     }
 }
 
-pub(crate) fn start<S>(builder: PeerBuilder, stream: S) -> Result<(RpcPeer, Connection), Error>
+pub(crate) fn start<S>(builder: &PeerBuilder, stream: S) -> Result<(RpcPeer, Connection), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -460,7 +460,14 @@ where
     });
     let peer = RpcPeer { shared };
     let (cancel, canceled) = oneshot::channel();
-    let task = runtime.spawn(run(stream, builder, peer.clone(), application, canceled));
+    // The task owns a snapshot, so the builder can keep registering and starting.
+    let task = runtime.spawn(run(
+        stream,
+        builder.clone(),
+        peer.clone(),
+        application,
+        canceled,
+    ));
     Ok((
         peer.clone(),
         Connection {

@@ -8,15 +8,16 @@ use crate::{Connection, Error, HandlerContext, RemoteError, RpcParams, RpcPeer, 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send>>;
 pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + Send + Sync>;
 
-/// Register typed asynchronous methods and notifications before consuming the
-/// builder to start a connection.
+/// Register typed asynchronous methods and notifications, then reuse the
+/// builder to start any number of connections.
 ///
 /// Duplicate names fail with [`Error::DuplicateMethod`], and request and
-/// notification names have separate registries. [`Self::start`] consumes the
-/// builder, validates the configuration, and requires the current Tokio
-/// runtime. It returns a cloneable [`RpcPeer`] and a separate [`Connection`]
-/// owner; keep the owner alive while you use the peer.
-#[derive(Default)]
+/// notification names have separate registries. [`Self::start`] validates the
+/// configuration, requires the current Tokio runtime, and returns a cloneable
+/// [`RpcPeer`] and a separate [`Connection`] owner; keep the owner alive while
+/// you use the peer. Calling `start` again reuses the registered handlers for
+/// another connection without re-registering them.
+#[derive(Clone, Default)]
 pub struct PeerBuilder {
     pub(crate) diagnostic_events: bool,
     pub(crate) config: crate::Config,
@@ -94,8 +95,12 @@ impl PeerBuilder {
     ///
     /// Accepts any owned `AsyncRead + AsyncWrite + Unpin + Send + 'static`
     /// stream. The returned connection owner must be retained for the
-    /// connection to stay alive.
-    pub fn start<S>(self, stream: S) -> Result<(RpcPeer, Connection), Error>
+    /// connection to stay alive. The builder is not consumed: call `start`
+    /// once per connection to share the registered handlers and configuration,
+    /// for example inside an accept loop. Each connection snapshots the
+    /// builder, so later registrations do not affect already-started
+    /// connections.
+    pub fn start<S>(&self, stream: S) -> Result<(RpcPeer, Connection), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {

@@ -274,3 +274,52 @@ async fn typed_enums_decode_inside_argument_lists_and_results() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn one_builder_starts_independent_connections() {
+    timeout(Duration::from_secs(3), async {
+        let mut builder = RpcPeer::builder()
+            .method("double", |_, (n,): (u32,)| async move { Ok(n * 2) })
+            .unwrap();
+        let (left_a, right_a) = tokio::io::duplex(128);
+        let (left_b, right_b) = tokio::io::duplex(128);
+        let (_server_a, server_a_owner) = builder.start(left_a).unwrap();
+        // Registered after connection A started: only connection B sees it.
+        builder = builder
+            .method("increment", |_, (n,): (u32,)| async move { Ok(n + 1) })
+            .unwrap();
+        let (_server_b, server_b_owner) = builder.start(left_b).unwrap();
+        let (client_a, client_a_owner) = RpcPeer::builder().start(right_a).unwrap();
+        let (client_b, client_b_owner) = RpcPeer::builder().start(right_b).unwrap();
+        let (first, second) = tokio::join!(
+            client_a.request::<_, u32>("double", (7,)),
+            client_b.request::<_, u32>("double", (9,)),
+        );
+        assert_eq!((first.unwrap(), second.unwrap()), (14, 18));
+        assert_eq!(
+            client_b
+                .request::<_, u32>("increment", (41,))
+                .await
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            client_a.request::<_, u32>("increment", (41,)).await,
+            Err(Error::Remote(msgpack_rpc_peer::Value::Map(vec![
+                ("code".into(), (-32601).into()),
+                ("message".into(), "unknown method".into()),
+            ])))
+        );
+        for connection in [
+            server_a_owner,
+            server_b_owner,
+            client_a_owner,
+            client_b_owner,
+        ] {
+            connection.terminate();
+            connection.wait().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
