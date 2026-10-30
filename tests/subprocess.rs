@@ -83,8 +83,93 @@ async fn verify() {
     }
 }
 
+#[cfg(feature = "cli")]
+async fn forward_peer() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    assert_eq!(
+        std::env::args().nth(2).as_deref(),
+        Some("literal $HOME ; spaces")
+    );
+    assert_eq!(std::env::var("MRPC_FIXTURE_ENV").unwrap(), "inherited");
+    let state = Arc::new(AtomicBool::new(false));
+    let login = state.clone();
+    let (_peer, owner) = RpcPeer::builder()
+        .method("login", move |_, (): ()| {
+            login.store(true, Ordering::SeqCst);
+            async { Ok(true) }
+        })
+        .unwrap()
+        .method("query", move |_, (): ()| {
+            let logged_in = state.load(Ordering::SeqCst);
+            async move { Ok(logged_in) }
+        })
+        .unwrap()
+        .method("exit", |_, (): ()| async {
+            std::process::exit(0);
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .unwrap()
+        .start(SplitIo::new(tokio::io::stdin(), tokio::io::stdout()))
+        .unwrap();
+    owner.wait().await.unwrap();
+}
+
+#[cfg(feature = "cli")]
+async fn verify_forward() {
+    use tokio::net::{TcpListener, TcpStream};
+    let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reserve.local_addr().unwrap();
+    drop(reserve);
+    let mut forward = Command::new(env!("CARGO_BIN_EXE_mrpc"))
+        .args(["forward", "--listen", &format!("tcp://{address}"), "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--forward-peer", "literal $HOME ; spaces"])
+        .env("MRPC_TARGET", "invalid")
+        .env("MRPC_FIXTURE_ENV", "inherited")
+        .env_remove("MRPC_TIMEOUT")
+        .env_remove("MRPC_OUTPUT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    for method in ["login", "query", "exit"] {
+        let stream = loop {
+            if let Ok(stream) = TcpStream::connect(address).await {
+                break stream;
+            }
+            assert!(
+                forward.try_wait().unwrap().is_none(),
+                "forward exited before accepting calls"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let (peer, owner) = RpcPeer::builder().start(stream).unwrap();
+        let result = peer.request::<_, bool>(method, ()).await;
+        if method == "exit" {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap());
+        }
+        owner.terminate();
+        owner.wait().await.unwrap();
+    }
+    let output = forward.wait_with_output().await.unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("subprocess exited"));
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    #[cfg(feature = "cli")]
+    if std::env::args().nth(1).as_deref() == Some("--forward-peer") {
+        forward_peer().await;
+        return;
+    }
     if let Some(mode) = std::env::args()
         .nth(1)
         .filter(|arg| arg.starts_with("--peer") || arg == "--exit" || arg == "--no-input")
@@ -92,5 +177,9 @@ async fn main() {
         child(&mode).await;
     } else {
         timeout(Duration::from_secs(10), verify()).await.unwrap();
+        #[cfg(feature = "cli")]
+        timeout(Duration::from_secs(10), verify_forward())
+            .await
+            .unwrap();
     }
 }

@@ -10,7 +10,7 @@ mrpc forward --help
 ```
 
 The optional `cli` feature enables clap, serde_json, and Tokio's networking,
-filesystem, and standard-input support. Default library builds leave them
+filesystem, process, signal, and standard-input support. Default library builds leave them
 disabled. Use `tcp://host:port` (including `tcp://[::1]:1234`) for TCP
 addresses or `unix:///absolute/path` for Unix addresses. A forwarder never
 overwrites an existing Unix socket. After stopping the forwarder, confirm that
@@ -75,6 +75,33 @@ callers. Target requests receive the library's unknown-method error because
 there is no unambiguous caller for reverse RPC. Direct commands also reject
 reverse requests. A notification caller's local flush through a forwarder
 is not confirmation that the target received or executed it.
+
+### Subprocess target
+
+```sh
+mrpc forward --listen unix:///tmp/shared.sock -- my-rpc-program --arg value
+```
+
+Only `forward` accepts a command after `--`. It starts one subprocess shared by
+all callers and exchanges binary MessagePack-RPC through its stdin and stdout.
+Arguments are passed directly, without shell interpretation; invoke `sh -c`
+explicitly if a shell is needed. The subprocess inherits the working directory,
+environment, and stderr, so diagnostics must go to stderr rather than stdout.
+
+A command overrides `MRPC_TARGET`. An explicit `--target` together with a
+command, or `--` without a program, is an error. Process creation and pipe setup
+define startup; there is no readiness handshake. Unresponsive peers use the
+existing request timeout and invalid traffic uses the library's protocol policy.
+
+Subprocess exit, even with status zero, or stdout EOF ends the shared session
+and makes the forwarder exit with status 1. The subprocess status is reported
+when available. The forwarder never restarts the subprocess or replays calls.
+On Ctrl-C or Unix SIGTERM it stops accepting callers, closes the RPC connection
+and subprocess stdin, and returns status 130 or 143 respectively. Cleanup on
+every exit path waits up to five seconds for the direct child to exit, then
+forcibly terminates and reaps it. This grace period is independent of
+`--timeout`; signals are not explicitly relayed, and descendant processes are
+not managed.
 
 ## Output
 
