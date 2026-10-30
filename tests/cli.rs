@@ -324,50 +324,72 @@ async fn unix_calls_support_all_params_sources_environment_override_and_notify_f
 #[tokio::test]
 async fn disconnected_and_timed_out_callers_leave_cross_transport_session_usable() {
     use msgpack_rpc_peer::Value as V;
-    timeout(Duration::from_secs(10), async {
-        let path = std::env::temp_dir().join(format!("mrpc-forward-{}.sock", std::process::id()));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
+    let path = std::env::temp_dir().join(format!("mrpc-forward-{}.sock", std::process::id()));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
-        let _cleanup = Cleanup(path.clone());
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reserve.local_addr().unwrap().to_string();
-        drop(reserve);
-        let target = format!("tcp://{address}");
-        let forward = cli()
-            .args([
-                "forward",
-                "--target",
-                &format!("unix://{}", path.display()),
-                "--listen",
-                &target,
-            ])
-            .spawn()
-            .unwrap();
-        let (mut session, _) = listener.accept().await.unwrap();
-        let mut abandoned = caller(&address).await;
+    }
+    let _cleanup = Cleanup(path.clone());
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reserve.local_addr().unwrap().to_string();
+    drop(reserve);
+    let target = format!("tcp://{address}");
+    let mut forward = cli()
+        .args([
+            "forward",
+            "--target",
+            &format!("unix://{}", path.display()),
+            "--listen",
+            &target,
+        ])
+        .spawn()
+        .unwrap();
+    macro_rules! stage {
+        ($name:literal, $future:expr) => {
+            tokio::select! {
+                result = timeout(Duration::from_secs(10), $future) => {
+                    result.unwrap_or_else(|_| panic!("timed out during {}", $name))
+                }
+                status = forward.wait() => {
+                    let status = status.expect("waiting for forwarder");
+                    let output = forward.wait_with_output().await.expect("reading forwarder output");
+                    panic!("forwarder exited during {}: {status}; stdout: {}; stderr: {}", $name,
+                        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                }
+            }
+        };
+    }
+    let (mut session, _) = stage!("target connection", listener.accept()).unwrap();
+    let mut abandoned = stage!("caller connection", caller(&address));
+    stage!(
+        "sending abandoned request",
         send(
             &mut abandoned,
             V::Array(vec![0.into(), 0.into(), "abandon".into(), V::Array(vec![])]),
         )
-        .await;
-        let abandoned_request = receive(&mut session).await;
-        drop(abandoned);
-        let timed = cli()
-            .args(["request", "slow", "--target", &target, "--timeout", "1"])
-            .spawn()
-            .unwrap();
-        let slow = receive(&mut session).await;
-        assert!(!timed.wait_with_output().await.unwrap().status.success());
-        let next = cli()
-            .args(["request", "query", "--target", &target])
-            .spawn()
-            .unwrap();
-        let query = receive(&mut session).await;
+    );
+    let abandoned_request = stage!("abandoned request", receive(&mut session));
+    drop(abandoned);
+    let timed = cli()
+        .args(["request", "slow", "--target", &target, "--timeout", "1"])
+        .spawn()
+        .unwrap();
+    let slow = stage!("slow request", receive(&mut session));
+    assert!(
+        !stage!("caller timeout", timed.wait_with_output())
+            .unwrap()
+            .status
+            .success()
+    );
+    let next = cli()
+        .args(["request", "query", "--target", &target])
+        .spawn()
+        .unwrap();
+    let query = stage!("query request", receive(&mut session));
+    stage!("sending responses", async {
         send(
             &mut session,
             response(abandoned_request[1].clone(), "old".into()),
@@ -379,17 +401,22 @@ async fn disconnected_and_timed_out_callers_leave_cross_transport_session_usable
             response(query[1].clone(), "session-alive".into()),
         )
         .await;
-        let output = next.wait_with_output().await.unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["value"],
-            "session-alive"
-        );
-        drop(session);
-        assert!(!forward.wait_with_output().await.unwrap().status.success());
-    })
-    .await
-    .unwrap();
+    });
+    let output = stage!("query response", next.wait_with_output()).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["value"],
+        "session-alive"
+    );
+    drop(session);
+    assert!(
+        !timeout(Duration::from_secs(10), forward.wait_with_output())
+            .await
+            .expect("timed out waiting for forwarder shutdown")
+            .unwrap()
+            .status
+            .success()
+    );
 }
 
 #[tokio::test]
