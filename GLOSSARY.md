@@ -29,3 +29,9 @@ A request initiated by a peer while it handles a request from the other peer.
 **Local call cancellation**:
 Ending the local wait for a response without promising that the remote operation stops.
 _Avoid_: Remote cancellation
+
+**Shared RPC session**:
+The target-side session associated with one persistent connection and shared by callers whose own connections may be short-lived.
+
+**Session forwarder**:
+An intermediary RPC peer that forwards method invocations from callers through a shared RPC session and returns request outcomes to their originating callers.

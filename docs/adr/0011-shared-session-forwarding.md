@@ -1,0 +1,3 @@
+# Preserve one target session across caller connections
+
+The test CLI's session forwarder shares one persistent target connection across short-lived caller connections, allowing separate invocations to reuse target-side session state. Requests may run concurrently and their IDs are remapped so outcomes return to the originating caller; caller disconnects and timeouts leave the shared session alive, while target disconnection terminates the forwarder without reconnecting or replaying operations because session state and prior operation outcomes may be unknown. Target-initiated notifications are printed by the forwarder, and target-initiated requests receive an unknown-method error because a shared session has no unambiguous caller to receive reverse RPC calls.
