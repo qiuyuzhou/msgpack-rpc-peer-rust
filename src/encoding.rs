@@ -303,3 +303,87 @@ macro_rules! structure {
 }
 structure!(SerializeStruct);
 structure!(SerializeStructVariant);
+
+/// Encode one complete MessagePack value, preserving invalid UTF-8 strings and map keys.
+/// Enforces the configured outgoing byte, depth and node limits before returning bytes.
+/// Does not preserve original wire widths. Invalid configuration is rejected.
+pub fn encode_value(value: &crate::Value, config: &crate::Config) -> Result<Vec<u8>, crate::Error> {
+    fn check(
+        value: &crate::Value,
+        depth: usize,
+        nodes: &mut usize,
+        config: &crate::Config,
+    ) -> Result<(), crate::Error> {
+        if *nodes == 0 {
+            return Err(crate::Error::ResourceLimit("decoded value nodes"));
+        }
+        *nodes -= 1;
+        let length = match value {
+            crate::Value::String(text) => text.as_bytes().len(),
+            crate::Value::Binary(bytes) | crate::Value::Ext(_, bytes) => bytes.len(),
+            crate::Value::Array(values) => values.len(),
+            crate::Value::Map(values) => values.len(),
+            _ => 0,
+        };
+        u32::try_from(length)
+            .map_err(|_| crate::Error::ResourceLimit("MessagePack value length"))?;
+        if matches!(value, crate::Value::Array(_) | crate::Value::Map(_))
+            && depth > config.max_depth
+        {
+            return Err(crate::Error::ResourceLimit("MessagePack nesting depth"));
+        }
+        match value {
+            crate::Value::Array(values) => {
+                for value in values {
+                    check(value, depth + 1, nodes, config)?;
+                }
+            }
+            crate::Value::Map(values) => {
+                for (key, value) in values {
+                    check(key, depth + 1, nodes, config)?;
+                    check(value, depth + 1, nodes, config)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut nodes = config.max_nodes;
+    config.validate()?;
+    check(value, 1, &mut nodes, config)?;
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        limit: config.max_outgoing_bytes,
+    };
+    write_value(&mut buffer, value)
+        .map_err(|_| crate::Error::Encode("value exceeds message limit".into()))?;
+    Ok(buffer.bytes)
+}
+
+// rmpv's encoder turns invalid UTF-8 strings into binary; preserve their string tag.
+fn write_value(writer: &mut impl Write, value: &crate::Value) -> Result<(), rmpv::encode::Error> {
+    use crate::Value;
+    match value {
+        Value::String(text) if text.as_str().is_none() => {
+            rmp::encode::write_str_len(writer, text.as_bytes().len() as u32)?;
+            writer
+                .write_all(text.as_bytes())
+                .map_err(rmpv::encode::Error::InvalidDataWrite)?;
+        }
+        Value::Array(values) => {
+            rmp::encode::write_array_len(writer, values.len() as u32)?;
+            for value in values {
+                write_value(writer, value)?;
+            }
+        }
+        Value::Map(values) => {
+            rmp::encode::write_map_len(writer, values.len() as u32)?;
+            for (key, value) in values {
+                write_value(writer, key)?;
+                write_value(writer, value)?;
+            }
+        }
+        _ => rmpv::encode::write_value(writer, value)?,
+    }
+    Ok(())
+}

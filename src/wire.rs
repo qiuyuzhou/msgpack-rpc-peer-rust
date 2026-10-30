@@ -251,11 +251,14 @@ pub(crate) fn value(bytes: Vec<u8>, config: &crate::Config) -> Result<Value, Err
 pub(crate) fn response(
     id: u32,
     outcome: Result<Value, crate::RemoteError>,
-    limit: usize,
+    config: &crate::Config,
 ) -> Result<Vec<u8>, Error> {
     let (error, result) = match outcome {
         Ok(result) => (Value::Nil, result),
         Err(error) => (error.into_value(), Value::Nil),
     };
-    encode(&(1u8, id, error, result), limit)
+    crate::encoding::encode_value(
+        &Value::Array(vec![1.into(), id.into(), error, result]),
+        config,
+    )
 }

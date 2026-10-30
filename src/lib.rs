@@ -36,6 +36,7 @@ mod wire;
 pub use transport::SplitIo;
 
 pub use config::Config;
+pub use encoding::encode_value;
 pub use error::{Error, RemoteError};
 pub use params::RpcParams;
 pub use peer::{Connection, HandlerContext, RpcPeer};

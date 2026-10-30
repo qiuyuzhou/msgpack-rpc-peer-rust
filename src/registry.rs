@@ -8,6 +8,9 @@ use crate::{Connection, Error, HandlerContext, RemoteError, RpcParams, RpcPeer, 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, RemoteError>> + Send>>;
 pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + Send + Sync>;
 
+pub(crate) type DynamicHandler =
+    Arc<dyn Fn(HandlerContext, String, Value) -> HandlerFuture + Send + Sync>;
+
 /// Register typed asynchronous methods and notifications, then reuse the
 /// builder to start any number of connections.
 ///
@@ -21,6 +24,8 @@ pub(crate) type Handler = Arc<dyn Fn(HandlerContext, Value) -> HandlerFuture + S
 pub struct PeerBuilder {
     pub(crate) diagnostic_events: bool,
     pub(crate) config: crate::Config,
+    pub(crate) fallback_method: Option<DynamicHandler>,
+    pub(crate) notification_sink: Option<tokio::sync::mpsc::Sender<(String, Value)>>,
     pub(crate) methods: HashMap<String, Handler>,
     pub(crate) notifications: HashMap<String, Handler>,
 }
@@ -89,6 +94,27 @@ impl PeerBuilder {
         }
         self.notifications.insert(name, typed_handler(handler));
         Ok(self)
+    }
+
+    /// Handle unregistered requests with their original method and dynamic params.
+    /// Named handlers take precedence. The normal handler budget and panic isolation apply.
+    pub fn fallback_method<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(HandlerContext, String, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, RemoteError>> + Send + 'static,
+    {
+        self.fallback_method = Some(Arc::new(move |context, method, params| {
+            Box::pin(handler(context, method, params))
+        }));
+        self
+    }
+
+    /// Queue unregistered notifications to a bounded channel at receipt, before EOF.
+    /// Named handlers take precedence. A full or closed channel drops the event
+    /// and increments the dropped-notification counter. No handler task is spawned.
+    pub fn notification_sink(mut self, sender: tokio::sync::mpsc::Sender<(String, Value)>) -> Self {
+        self.notification_sink = Some(sender);
+        self
     }
 
     /// Attach an already-established stream using the current Tokio runtime.

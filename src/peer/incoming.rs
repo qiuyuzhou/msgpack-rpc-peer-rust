@@ -47,15 +47,15 @@ pub(super) struct IncomingRequest {
 impl IncomingRequest {
     pub(super) fn respond(self, outcome: Result<Value, RemoteError>) -> Result<(), Error> {
         let shared = self.requests.shared.clone();
-        let limit = shared.config.max_outgoing_bytes;
-        let bytes = wire::response(self.id, outcome, limit).or_else(|_| {
+        let config = &shared.config;
+        let bytes = wire::response(self.id, outcome, config).or_else(|_| {
             wire::response(
                 self.id,
                 Err(RemoteError::builtin(
                     -32603,
                     "response serialization failed",
                 )),
-                limit,
+                config,
             )
         })?;
         let requests = self.requests.clone();
@@ -63,6 +63,7 @@ impl IncomingRequest {
         let frame = Outgoing {
             bytes,
             request_id: None,
+            flushed: None,
             _incoming: Some(self),
             _frame: WorkGuard {
                 shared,

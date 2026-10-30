@@ -30,6 +30,7 @@ use outgoing::{OutgoingRequest, PendingRequests};
 struct Outgoing {
     bytes: Vec<u8>,
     request_id: Option<u32>,
+    flushed: Option<oneshot::Sender<()>>,
     _incoming: Option<IncomingRequest>,
     _frame: WorkGuard,
 }
@@ -73,6 +74,7 @@ impl Shared {
         permit: mpsc::Permit<'_, Outgoing>,
         bytes: Vec<u8>,
         request_id: Option<u32>,
+        flushed: Option<oneshot::Sender<()>>,
     ) -> Result<(), Error> {
         let mut state = self.state.lock().unwrap();
         if let Some(error) = &state.terminal {
@@ -83,6 +85,7 @@ impl Shared {
         permit.send(Outgoing {
             bytes,
             request_id,
+            flushed,
             _incoming: None,
             _frame: WorkGuard {
                 shared: self.clone(),
@@ -211,7 +214,7 @@ impl RpcPeer {
             &(2u8, method, encoded),
             self.shared.config.max_outgoing_bytes,
         )?;
-        self.shared.commit(permit, frame, None)
+        self.shared.commit(permit, frame, None, None)
     }
 
     /// Send typed params and decode a typed result.
@@ -273,6 +276,55 @@ impl RpcPeer {
         tokio::time::timeout_at(deadline, self.request_inner(method, params, lease))
             .await
             .map_err(|_| Error::Timeout)?
+    }
+
+    /// Call with a dynamic params array and retain the complete dynamic result.
+    /// Uses the same deadlines, cancellation, IDs and capacity bounds as typed calls.
+    pub async fn request_value(&self, method: &str, params: Value) -> Result<Value, Error> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.shared.config.default_call_timeout)
+            .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
+        tokio::time::timeout_at(deadline, async {
+            let _operation = self.shared.admit(None)?;
+            OutgoingRequest::begin(&self.shared)
+                .await?
+                .send_value(method, params)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Send a dynamic params array and wait for this frame's local write and flush.
+    /// Uses the configured whole-call deadline, including queue waits. Success
+    /// does not confirm remote execution. A canceled started frame may still finish.
+    pub async fn notify_value(&self, method: &str, params: Value) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.shared.config.default_call_timeout)
+            .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
+        tokio::time::timeout_at(deadline, async {
+            let _operation = self.shared.admit(None)?;
+            let permit = self
+                .shared
+                .outgoing
+                .reserve()
+                .await
+                .map_err(|_| self.shared.terminal())?;
+            let bytes = self.value_frame(vec![2.into(), method.into(), params])?;
+            let (flushed, receiver) = oneshot::channel();
+            self.shared.commit(permit, bytes, None, Some(flushed))?;
+            receiver.await.map_err(|_| self.shared.terminal())
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    fn value_frame(&self, fields: Vec<Value>) -> Result<Vec<u8>, Error> {
+        let params = fields.last().unwrap();
+        if !params.is_array() {
+            return Err(Error::InvalidParams);
+        }
+        crate::encoding::encode_value(&Value::Array(fields), &self.shared.config)
     }
 
     async fn request_inner<P: RpcParams + Serialize, R: DeserializeOwned>(
@@ -487,7 +539,7 @@ async fn writer<W: AsyncWrite + Unpin>(
 ) -> Error {
     let mut prefer_application = true;
     loop {
-        let (frame, application_frame) = if prefer_application {
+        let (mut frame, application_frame) = if prefer_application {
             tokio::select! { biased;
                 Some(frame) = application.recv() => (frame, true),
                 Some(frame) = responses.recv() => (frame, false),
@@ -512,6 +564,9 @@ async fn writer<W: AsyncWrite + Unpin>(
         }
         if let Err(e) = writer.flush().await {
             return Error::Transport(e.to_string());
+        }
+        if let Some(flushed) = frame.flushed.take() {
+            let _ = flushed.send(());
         }
     }
 }
@@ -604,7 +659,11 @@ where
                                 Ok(incoming) => incoming,
                                 Err(error) => break error,
                             };
-                            let Some(handler) = builder.methods.get(&method).cloned() else {
+                            let Some(handler) = builder.methods.get(&method).cloned().or_else(|| {
+                                let fallback = builder.fallback_method.clone()?;
+                                let method = method.clone();
+                                Some(Arc::new(move |context, params| fallback(context, method.clone(), params)) as crate::registry::Handler)
+                            }) else {
                                 if let Err(error) = incoming.respond(Err(RemoteError::builtin(-32601, "unknown method"))) { break error; }
                                 continue;
                             };
@@ -622,6 +681,14 @@ where
                             if handlers.len() >= builder.config.max_handlers {
                                 peer.shared.diagnostics.record(DiagnosticEvent::NotificationDropped);
                                 continue;
+                            }
+                            if !builder.notifications.contains_key(&method) {
+                                if let Some(sink) = &builder.notification_sink {
+                                    if sink.try_send((method, params)).is_err() {
+                                        peer.shared.diagnostics.record(DiagnosticEvent::NotificationDropped);
+                                    }
+                                    continue;
+                                }
                             }
                             if let Some(handler) = builder.notifications.get(&method).cloned() {
                                 let active_lease = Arc::new(AtomicBool::new(true));
