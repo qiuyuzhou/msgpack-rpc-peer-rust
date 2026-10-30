@@ -270,29 +270,33 @@ impl RpcPeer {
         timeout: Duration,
         lease: Option<&AtomicBool>,
     ) -> Result<R, Error> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
-        tokio::time::timeout_at(deadline, self.request_inner(method, params, lease))
-            .await
-            .map_err(|_| Error::Timeout)?
+        OutgoingRequest::execute(
+            &self.shared,
+            timeout,
+            lease,
+            |id| {
+                let encoded = typed::encode_params(params, &self.shared.config)?;
+                wire::encode(
+                    &(0u8, id, method, encoded),
+                    self.shared.config.max_outgoing_bytes,
+                )
+            },
+            |value| typed::decode_result(value, self.shared.config.max_incoming_bytes),
+        )
+        .await
     }
 
     /// Call with a dynamic params array and retain the complete dynamic result.
     /// Uses the same deadlines, cancellation, IDs and capacity bounds as typed calls.
     pub async fn request_value(&self, method: &str, params: Value) -> Result<Value, Error> {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.shared.config.default_call_timeout)
-            .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
-        tokio::time::timeout_at(deadline, async {
-            let _operation = self.shared.admit(None)?;
-            OutgoingRequest::begin(&self.shared)
-                .await?
-                .send_value(method, params)
-                .await
-        })
+        OutgoingRequest::execute(
+            &self.shared,
+            self.shared.config.default_call_timeout,
+            None,
+            |id| self.value_frame(vec![0.into(), id.into(), method.into(), params]),
+            Ok,
+        )
         .await
-        .map_err(|_| Error::Timeout)?
     }
 
     /// Send a dynamic params array and wait for this frame's local write and flush.
@@ -325,19 +329,6 @@ impl RpcPeer {
             return Err(Error::InvalidParams);
         }
         crate::encoding::encode_value(&Value::Array(fields), &self.shared.config)
-    }
-
-    async fn request_inner<P: RpcParams + Serialize, R: DeserializeOwned>(
-        &self,
-        method: &str,
-        params: P,
-        lease: Option<&AtomicBool>,
-    ) -> Result<R, Error> {
-        let _operation = self.shared.admit(lease)?;
-        OutgoingRequest::begin(&self.shared)
-            .await?
-            .send(method, params)
-            .await
     }
 }
 

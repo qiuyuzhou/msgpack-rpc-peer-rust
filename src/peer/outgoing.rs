@@ -1,10 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
-use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::Shared;
-use crate::{Error, RpcParams, Value, typed, wire};
+use crate::{Error, Value};
 
 type Reply = oneshot::Sender<Result<Value, Error>>;
 
@@ -50,7 +53,7 @@ pub(super) struct OutgoingRequest {
 }
 
 impl OutgoingRequest {
-    pub(super) async fn begin(shared: &Arc<Shared>) -> Result<Self, Error> {
+    async fn begin(shared: &Arc<Shared>) -> Result<Self, Error> {
         let slots = shared.state.lock().unwrap().pending.slots.clone();
         let slot = slots.acquire_owned().await.map_err(|_| shared.terminal())?;
         let (sender, receiver) = oneshot::channel();
@@ -70,44 +73,33 @@ impl OutgoingRequest {
         })
     }
 
-    pub(super) async fn send<P: RpcParams + Serialize, R: DeserializeOwned>(
-        mut self,
-        method: &str,
-        params: P,
+    pub(super) async fn execute<R>(
+        shared: &Arc<Shared>,
+        timeout: Duration,
+        lease: Option<&AtomicBool>,
+        encode: impl FnOnce(u32) -> Result<Vec<u8>, Error>,
+        decode: impl FnOnce(Value) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let permit = self
-            .shared
-            .outgoing
-            .reserve()
-            .await
-            .map_err(|_| self.shared.terminal())?;
-        let encoded = typed::encode_params(params, &self.shared.config)?;
-        let frame = wire::encode(
-            &(0u8, self.id, method, encoded),
-            self.shared.config.max_outgoing_bytes,
-        )?;
-        self.shared.commit(permit, frame, Some(self.id), None)?;
-        let value = (&mut self.receiver)
-            .await
-            .map_err(|_| self.shared.terminal())??;
-        typed::decode_result(value, self.shared.config.max_incoming_bytes)
-    }
-
-    pub(super) async fn send_value(mut self, method: &str, params: Value) -> Result<Value, Error> {
-        let permit = self
-            .shared
-            .outgoing
-            .reserve()
-            .await
-            .map_err(|_| self.shared.terminal())?;
-        let peer = super::RpcPeer {
-            shared: self.shared.clone(),
-        };
-        let frame = peer.value_frame(vec![0.into(), self.id.into(), method.into(), params])?;
-        self.shared.commit(permit, frame, Some(self.id), None)?;
-        (&mut self.receiver)
-            .await
-            .map_err(|_| self.shared.terminal())?
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(Error::InvalidConfig("call timeout exceeds the clock range"))?;
+        tokio::time::timeout_at(deadline, async {
+            let _operation = shared.admit(lease)?;
+            let mut request = Self::begin(shared).await?;
+            let permit = shared
+                .outgoing
+                .reserve()
+                .await
+                .map_err(|_| shared.terminal())?;
+            let frame = encode(request.id)?;
+            shared.commit(permit, frame, Some(request.id), None)?;
+            let value = (&mut request.receiver)
+                .await
+                .map_err(|_| shared.terminal())??;
+            decode(value)
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
     }
 }
 

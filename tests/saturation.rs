@@ -1,4 +1,4 @@
-use msgpack_rpc_peer::{Config, Error, RpcPeer};
+use msgpack_rpc_peer::{Config, Error, RpcPeer, Value};
 use tokio::{
     io::AsyncReadExt,
     time::{Duration, timeout},
@@ -6,24 +6,63 @@ use tokio::{
 
 #[tokio::test]
 async fn timeout_and_abort_release_pending_capacity_and_termination_wakes_waiters() {
-    timeout(Duration::from_secs(3), async {
-        let (stream, mut raw) = tokio::io::duplex(64);
-        let (peer, connection) = RpcPeer::builder().config(Config { max_pending_calls: 1, ..Config::default() }).start(stream).unwrap();
-        let first_peer = peer.clone();
-        let first = tokio::spawn(async move { first_peer.request::<_, ()>("x", ()).await });
-        let mut bytes = [0; 6]; raw.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10)).await, Err(Error::Timeout));
-        first.abort(); let _ = first.await;
-        let second_peer = peer.clone();
-        let second = tokio::spawn(async move { second_peer.request::<_, ()>("x", ()).await });
-        raw.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(&bytes, b"\x94\x00\x01\xa1x\x90");
-        let mut waiting = Box::pin(peer.request::<_, ()>("x", ()));
-        tokio::select! { biased; result = &mut waiting => panic!("unexpected {result:?}"), _ = std::future::ready(()) => {} }
-        connection.terminate(); connection.wait().await.unwrap();
-        assert_eq!(waiting.await, Err(Error::Closed));
-        assert_eq!(second.await.unwrap(), Err(Error::Closed));
-    }).await.unwrap();
+    for dynamic in [false, true] {
+        let scenario = async {
+            let (stream, mut raw) = tokio::io::duplex(64);
+            let (peer, connection) = RpcPeer::builder()
+                .config(Config {
+                    default_call_timeout: Duration::from_millis(10),
+                    max_pending_calls: 1,
+                    ..Config::default()
+                })
+                .start(stream)
+                .unwrap();
+            let first_peer = peer.clone();
+            let first = tokio::spawn(async move {
+                first_peer
+                    .request_with_timeout::<_, ()>("x", (), Duration::from_secs(1))
+                    .await
+            });
+            let mut bytes = [0; 6];
+            raw.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(
+                if dynamic {
+                    peer.request_value("x", Value::Array(vec![]))
+                        .await
+                        .map(|_| ())
+                } else {
+                    peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10))
+                        .await
+                },
+                Err(Error::Timeout)
+            );
+            first.abort();
+            let _ = first.await;
+            let second_peer = peer.clone();
+            let second = tokio::spawn(async move {
+                second_peer
+                    .request_with_timeout::<_, ()>("x", (), Duration::from_secs(1))
+                    .await
+            });
+            raw.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"\x94\x00\x01\xa1x\x90");
+            let mut waiting = Box::pin(async {
+                if dynamic {
+                    peer.request_value("x", Value::Array(vec![]))
+                        .await
+                        .map(|_| ())
+                } else {
+                    peer.request::<_, ()>("x", ()).await
+                }
+            });
+            tokio::select! { biased; result = &mut waiting => panic!("unexpected {result:?}"), _ = std::future::ready(()) => {} }
+            connection.terminate();
+            connection.wait().await.unwrap();
+            assert_eq!(waiting.await, Err(Error::Closed));
+            assert_eq!(second.await.unwrap(), Err(Error::Closed));
+        };
+        timeout(Duration::from_secs(3), scenario).await.unwrap();
+    }
 }
 
 async fn read_value(raw: &mut tokio::io::DuplexStream) -> msgpack_rpc_peer::Value {
@@ -98,18 +137,39 @@ async fn one_shared_handler_slot_rejects_requests_and_counts_dropped_notificatio
 
 #[tokio::test]
 async fn whole_call_timeout_covers_a_full_application_queue() {
-    timeout(Duration::from_secs(3), async {
-        let (stream, mut raw) = tokio::io::duplex(1);
-        let (peer, connection) = RpcPeer::builder().config(Config { application_queue_capacity: 1, ..Config::default() }).start(stream).unwrap();
-        peer.notify("n", ("a".repeat(128),)).await.unwrap();
-        assert_eq!(raw.read_u8().await.unwrap(), 0x93);
-        peer.notify("n", ()).await.unwrap();
-        assert_eq!(peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10)).await, Err(Error::Timeout));
-        let mut waiting = Box::pin(peer.notify("n", ()));
-        tokio::select! { biased; result = &mut waiting => panic!("unexpected {result:?}"), _ = std::future::ready(()) => {} }
-        connection.terminate(); connection.wait().await.unwrap();
-        assert_eq!(waiting.await, Err(Error::Closed));
-    }).await.unwrap();
+    for dynamic in [false, true] {
+        let scenario = async {
+            let (stream, mut raw) = tokio::io::duplex(1);
+            let (peer, connection) = RpcPeer::builder()
+                .config(Config {
+                    default_call_timeout: Duration::from_millis(10),
+                    application_queue_capacity: 1,
+                    ..Config::default()
+                })
+                .start(stream)
+                .unwrap();
+            peer.notify("n", ("a".repeat(128),)).await.unwrap();
+            assert_eq!(raw.read_u8().await.unwrap(), 0x93);
+            peer.notify("n", ()).await.unwrap();
+            assert_eq!(
+                if dynamic {
+                    peer.request_value("x", Value::Array(vec![]))
+                        .await
+                        .map(|_| ())
+                } else {
+                    peer.request_with_timeout::<_, ()>("x", (), Duration::from_millis(10))
+                        .await
+                },
+                Err(Error::Timeout)
+            );
+            let mut waiting = Box::pin(peer.notify("n", ()));
+            tokio::select! { biased; result = &mut waiting => panic!("unexpected {result:?}"), _ = std::future::ready(()) => {} }
+            connection.terminate();
+            connection.wait().await.unwrap();
+            assert_eq!(waiting.await, Err(Error::Closed));
+        };
+        timeout(Duration::from_secs(3), scenario).await.unwrap();
+    }
 }
 
 #[tokio::test]
