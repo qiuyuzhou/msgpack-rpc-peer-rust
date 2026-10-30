@@ -2,14 +2,12 @@ use super::{
     Failure,
     args::Options,
     output::emit,
-    transport::{Address, Listener, Socket},
+    target::Target,
+    transport::{Address, Listener},
 };
-use msgpack_rpc_peer::{Config, Error, RemoteError, RpcPeer, SplitIo, Value};
-use std::{error::Error as StdError, ffi::OsString, process::Stdio, time::Duration};
-use tokio::{
-    process::{Child, Command},
-    task::JoinSet,
-};
+use msgpack_rpc_peer::{Config, Error, RemoteError, RpcPeer, Value};
+use std::{error::Error as StdError, ffi::OsString, future::Future, time::Duration};
+use tokio::task::JoinSet;
 
 fn forward_error(error: Error) -> RemoteError {
     match error {
@@ -20,22 +18,8 @@ fn forward_error(error: Error) -> RemoteError {
 async fn forward_session(
     options: &Options,
     listener: Listener,
-    stream: Socket,
-    child: &mut Option<Child>,
+    target: RpcPeer,
 ) -> Result<(), Failure> {
-    let format = options.output;
-    let (events, mut receiver) = tokio::sync::mpsc::channel(Config::default().max_handlers);
-    let builder = RpcPeer::builder()
-        .config(options.config())
-        .notification_sink(events);
-    let output = async move {
-        while let Some((method, params)) = receiver.recv().await {
-            emit("notification", Some(&method), params, format, false).await?;
-        }
-        Ok::<(), Failure>(())
-    };
-    tokio::pin!(output);
-    let (target, owner) = builder.start(stream)?;
     let requests = target.clone();
     let (notifications, mut notification_rx) =
         tokio::sync::mpsc::channel::<(String, Value)>(Config::default().application_queue_capacity);
@@ -60,28 +44,9 @@ async fn forward_session(
         })
         .notification_sink(notifications);
     let mut connections = JoinSet::new();
-    let mut waiting = Box::pin(owner.wait());
     loop {
         tokio::select! {
-            status = async {
-                match child.as_mut() {
-                    Some(child) => child.wait().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                drop(waiting);
-                drop(builder);
-                tokio::time::timeout(Config::default().graceful_shutdown_timeout, &mut output).await??;
-                return Err(format!("subprocess exited: {}; shared session ended", status?).into());
-            }
-            result = &mut output => { result?; return Err("notification output closed".into()); }
             result = &mut notifying => { result?; return Err("notification forwarding closed".into()); }
-            result = &mut waiting => {
-                drop(builder);
-                tokio::time::timeout(Config::default().graceful_shutdown_timeout, &mut output).await??;
-                result?;
-                return Err("target connection closed; shared session ended".into());
-            }
             stream = listener.accept(), if connections.len() < Config::default().max_pending_calls => {
                 let (_, owner) = callers.start(stream?)?;
                 connections.spawn(owner.wait());
@@ -143,44 +108,87 @@ pub(super) async fn run(
     let listener = Listener::bind(Address::parse(&listen)?).await?;
     let signal = stop_signal()?;
     tokio::pin!(signal);
-    let mut child = None;
-    let stream: Socket = if let Some(address) = address {
-        tokio::select! {
+    let (events, mut receiver) = tokio::sync::mpsc::channel(Config::default().max_handlers);
+    let builder = RpcPeer::builder()
+        .config(options.config())
+        .notification_sink(events);
+    let (peer, mut target) = if let Some(address) = address {
+        let stream = tokio::select! {
             stream = tokio::time::timeout(Duration::from_secs(options.timeout), address.connect()) => stream??,
             code = &mut signal => return Err(Box::new(Interrupted(code))),
-        }
+        };
+        Target::connected(&builder, stream)?
     } else {
-        let mut process = Command::new(&command[0])
-            .args(&command[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stream = SplitIo::new(
-            process.stdout.take().unwrap(),
-            process.stdin.take().unwrap(),
-        );
-        child = Some(process);
-        Box::new(stream)
+        Target::spawn(&builder, &command).await?
     };
-    let result = {
-        let session = forward_session(&options, listener, stream, &mut child);
+    let output = async {
+        while let Some((method, params)) = receiver.recv().await {
+            emit("notification", Some(&method), params, options.output, false).await?;
+        }
+        Ok::<(), Failure>(())
+    };
+    tokio::pin!(output);
+    let (result, drain_output) = {
+        let session = forward_session(&options, listener, peer);
         tokio::pin!(session);
         tokio::select! {
-            result = &mut session => result,
-            code = &mut signal => Err(Box::new(Interrupted(code)) as Failure),
+            result = target.wait() => (result, true),
+            result = &mut session => (result, false),
+            result = &mut output => (result.and(Err("notification output closed".into())), false),
+            code = &mut signal => (Err(Box::new(Interrupted(code)) as Failure), false),
         }
     };
-    if let Some(child) = child.as_mut() {
-        let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                child.kill().await?;
-                child.wait().await?
-            }
-        };
-        eprintln!("mrpc: subprocess exited: {status}");
+    drop(builder);
+    finish(result, target.cleanup(), async {
+        if drain_output {
+            tokio::time::timeout(Config::default().graceful_shutdown_timeout, output).await??;
+        }
+        Ok(())
+    })
+    .await
+}
+
+async fn finish(
+    result: Result<(), Failure>,
+    cleanup: impl Future<Output = Result<(), Failure>>,
+    output: impl Future<Output = Result<(), Failure>>,
+) -> Result<(), Failure> {
+    let (cleanup, output) = tokio::join!(cleanup, output);
+    if let Err(error) = cleanup {
+        eprintln!("mrpc: target cleanup failed: {error}");
+    }
+    if let Err(error) = output {
+        eprintln!("mrpc: notification output drain failed: {error}");
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::ready;
+
+    #[tokio::test]
+    async fn cleanup_and_output_failures_preserve_signal_exit_codes() {
+        for code in [130, 143] {
+            for cleanup_fails in [false, true] {
+                let cleanup = if cleanup_fails {
+                    Err("injected child wait failure".into())
+                } else {
+                    Ok(())
+                };
+                let error = finish(
+                    Err(Box::new(Interrupted(code))),
+                    ready(cleanup),
+                    ready(Err("injected output failure".into())),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<Interrupted>().map(|error| error.0),
+                    Some(code)
+                );
+            }
+        }
+    }
 }
