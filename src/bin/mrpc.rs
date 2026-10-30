@@ -38,9 +38,9 @@ enum Operation {
 struct Options {
     #[arg(long, env = "MRPC_TARGET")]
     target: String,
-    #[arg(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, env = "MRPC_TIMEOUT", default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
-    #[arg(long, value_enum, default_value = "compact")]
+    #[arg(short, long, env = "MRPC_OUTPUT", value_enum, default_value = "pretty")]
     output: Output,
 }
 #[derive(Clone, Copy, ValueEnum)]
@@ -53,7 +53,7 @@ struct Call {
     method: String,
     #[command(flatten)]
     options: Options,
-    #[arg(long, conflicts_with = "params_file")]
+    #[arg(short, long, conflicts_with = "params_file")]
     params: Option<String>,
     /// JSON array file; use - to read stdin to EOF.
     #[arg(long)]

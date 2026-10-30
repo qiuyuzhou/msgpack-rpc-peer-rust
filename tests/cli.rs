@@ -7,6 +7,8 @@ fn cli() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mrpc"));
     command
         .env_remove("MRPC_TARGET")
+        .env_remove("MRPC_OUTPUT")
+        .env_remove("MRPC_TIMEOUT")
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -20,7 +22,7 @@ async fn request_returns_a_record_and_closes_the_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = format!("tcp://{}", listener.local_addr().unwrap());
         let child = cli()
-            .args(["request", "sum", "--target", &target, "--params", "[2,3]"])
+            .args(["request", "sum", "--target", &target, "-p", "[2,3]"])
             .spawn()
             .unwrap();
         let (_, owner) = RpcPeer::builder()
@@ -30,6 +32,8 @@ async fn request_returns_a_record_and_closes_the_connection() {
             .unwrap();
         let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success(), "{:?}", output);
+        assert!(output.stdout.contains(&b'\n'));
+        assert!(output.stdout.contains(&b' '));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
             serde_json::json!({"type":"result", "encoding":"json", "value":5})
@@ -675,4 +679,33 @@ async fn independent_cli_calls_reuse_login_state_on_one_target_connection() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn environment_options_are_validated_and_cli_options_override_them() {
+    let output = cli()
+        .env("MRPC_TIMEOUT", "0")
+        .args(["request", "x", "--target", "invalid"])
+        .output()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--timeout"));
+
+    let output = cli()
+        .env("MRPC_TIMEOUT", "0")
+        .env("MRPC_OUTPUT", "invalid")
+        .args([
+            "request",
+            "x",
+            "--target",
+            "invalid",
+            "--timeout",
+            "1",
+            "-o",
+            "compact",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("address must"));
 }
