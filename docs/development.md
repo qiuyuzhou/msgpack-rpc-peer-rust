@@ -48,13 +48,15 @@ cargo run --locked --example duplex
 cargo run --locked --example bidirectional
 cargo run --locked --example nested
 cargo run --locked --example unix
-cargo run --locked --example unix-server -- /tmp/msgpack-rpc-example.sock
+cargo run --locked --example rpc-server -- tcp 127.0.0.1:4000
+cargo run --locked --example rpc-server -- unix /tmp/msgpack-rpc-example.sock
 cargo run --locked --example subprocess
 ```
 
-The `unix` and `unix-server` examples run only on Unix. The `unix-server`
-example serves until killed. Remove its socket file before starting it again,
-after confirming that no server is using it. Subprocess tests use a separate executable
+The `unix` example and the `rpc-server unix` mode run only on Unix. The
+`rpc-server` TCP and Unix modes serve until killed. Remove the Unix socket file
+before starting it again, after confirming that no process is using it. The
+`rpc-server stdio` mode uses stdin/stdout and exits when its RPC connection closes. Subprocess tests use a separate executable
 harness so test output cannot corrupt RPC stdout. Tests cover real Unix sockets
 and child processes, bounded queue saturation, cancellation, panic diagnostics,
 and owned shutdown. Compiler and platform coverage beyond this validation

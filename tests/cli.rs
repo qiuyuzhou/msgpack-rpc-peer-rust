@@ -870,3 +870,128 @@ async fn missing_target_is_rejected_before_reading_stdin() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--target"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_server_example_serves_sum_over_all_transports() {
+    let build = std::process::Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--locked",
+            "--example",
+            "rpc-server",
+            "--message-format=json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let example = String::from_utf8(build.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|artifact| {
+            artifact["target"]["name"] == "rpc-server" && artifact["executable"].is_string()
+        })
+        .unwrap()["executable"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut stdio = Command::new(&example)
+        .arg("stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    drop(stdio.stdin.take());
+    assert!(
+        timeout(Duration::from_secs(2), stdio.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    timeout(Duration::from_secs(15), async {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let directory =
+            std::env::temp_dir().join(format!("rpc-server-test-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let socket = directory.join("rpc.sock");
+        for mode in ["tcp", "unix", "stdio"] {
+            let (mut process, target) = if mode == "stdio" {
+                let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = reserve.local_addr().unwrap().to_string();
+                drop(reserve);
+                let target = format!("tcp://{address}");
+                let process = cli()
+                    .args(["forward", "--listen", &target, "--"])
+                    .arg(&example)
+                    .arg("stdio")
+                    .spawn()
+                    .unwrap();
+                drop(caller(&address).await);
+                (process, target)
+            } else {
+                let address = if mode == "tcp" {
+                    "127.0.0.1:0".to_owned()
+                } else {
+                    socket.to_str().unwrap().to_owned()
+                };
+                let mut process = Command::new(&example)
+                    .args([mode, &address])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let mut ready = String::new();
+                BufReader::new(process.stderr.take().unwrap())
+                    .read_line(&mut ready)
+                    .await
+                    .unwrap();
+                let address = ready.trim().strip_prefix("listening on ").unwrap();
+                let target = format!("{mode}://{address}");
+                (process, target)
+            };
+            for params in ["[2,3]", "[4294967295,4294967295]"] {
+                let output = cli()
+                    .args(["request", "sum", "--target", &target, "-p", params])
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(output.status.success(), "{mode}: {:?}", output);
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(
+                    value["value"],
+                    if params == "[2,3]" { 5_u64 } else { 8589934590 }
+                );
+            }
+            if mode == "stdio" {
+                let status = Command::new("kill")
+                    .args(["-TERM", &process.id().unwrap().to_string()])
+                    .status()
+                    .await
+                    .unwrap();
+                assert!(status.success());
+            } else {
+                process.start_kill().unwrap();
+            }
+            process.wait().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
