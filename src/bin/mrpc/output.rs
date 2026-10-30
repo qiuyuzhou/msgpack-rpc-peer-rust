@@ -1,5 +1,7 @@
+use super::{Failure, args::Output};
 use msgpack_rpc_peer::Value;
 use serde_json::{Map, Value as Json, json};
+use tokio::io::AsyncWriteExt;
 
 // Conversion is explicit: Serde can silently coerce special MessagePack values.
 fn json_value(value: &Value) -> Option<Json> {
@@ -51,4 +53,29 @@ pub(super) fn record(
         record["value"] = value;
     }
     Ok(record)
+}
+
+pub(super) async fn emit(
+    kind: &str,
+    method: Option<&str>,
+    value: Value,
+    format: Output,
+    error: bool,
+) -> Result<(), Failure> {
+    let record = record(kind, method, value)?;
+    let text = match format {
+        Output::Compact => serde_json::to_string(&record)?,
+        Output::Pretty => serde_json::to_string_pretty(&record)?,
+    };
+    let bytes = format!("{text}\n");
+    if error {
+        let mut output = tokio::io::stderr();
+        output.write_all(bytes.as_bytes()).await?;
+        output.flush().await?;
+    } else {
+        let mut output = tokio::io::stdout();
+        output.write_all(bytes.as_bytes()).await?;
+        output.flush().await?;
+    }
+    Ok(())
 }
