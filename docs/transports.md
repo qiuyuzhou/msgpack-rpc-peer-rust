@@ -16,8 +16,8 @@ On Unix platforms, attach an established `tokio::net::UnixStream` directly. Use
 `UnixListener::bind`/`accept` and `UnixStream::connect` when communicating between
 processes; the application owns socket path selection and cleanup. The executable
 `cargo run --example unix` demonstrates equal peers using a socket pair.
-`cargo run --example unix-server -- <socket-path>` runs a listener that serves
-`sum` to any number of connecting clients, as a server fixture for tests. The
+`cargo run --example rpc-server -- unix <socket-path>` runs a listener that serves
+`sum` to any number of connecting RPC peers, as a fixture for tests. The
 integration test also exercises a real filesystem listener and connecting peer.
 Unix coverage is conditionally compiled; it does not provide Windows coverage.
 
@@ -45,3 +45,36 @@ exit with a pending call, connection completion, and explicit process reaping.
 Write-side broken-pipe coverage additionally closes a real child's input on Unix.
 Tokio's `net`, `process`, and `io-std` features are development-only requirements
 for these tests and examples; the core dependency uses generic asynchronous I/O.
+
+## Multi-transport sum example
+
+`rpc-server` exposes `sum` with two `u32` arguments and a `u64` result. Select
+one transport explicitly (no `cli` feature is needed to run the example):
+
+```sh
+cargo run --locked --example rpc-server -- stdio
+cargo run --locked --example rpc-server -- tcp 127.0.0.1:4000
+cargo run --locked --example rpc-server -- unix /tmp/msgpack-rpc-example.sock
+```
+
+TCP and Unix listeners accept multiple connections until terminated and report
+readiness on stderr. TCP port `0` selects an available port; stderr reports the
+actual address. Unix mode is available only on Unix; the caller cleans up the
+socket file. In stdio mode, a parent process owns stdin/stdout, stdout contains
+only RPC bytes, and the example exits when the RPC connection closes.
+
+With the TCP example running, call it through the CLI:
+
+```sh
+cargo run --locked --features cli --bin mrpc -- request sum --target tcp://127.0.0.1:4000 -p '[2,3]'
+```
+
+For stdio, build the example and let a session forwarder own the subprocess:
+
+```sh
+cargo build --locked --example rpc-server
+cargo run --locked --features cli --bin mrpc -- forward --listen tcp://127.0.0.1:4000 -- target/debug/examples/rpc-server stdio
+```
+
+The same CLI request returns `5` through the forwarder. Stop the forwarder to
+close the subprocess connection and reap it.
