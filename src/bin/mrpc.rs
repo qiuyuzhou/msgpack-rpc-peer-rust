@@ -15,7 +15,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 type Socket = Box<dyn Stream>;
 
 #[derive(Parser)]
-#[command(name = "mrpc", about = "MessagePack-RPC calls and shared sessions")]
+#[command(
+    name = "mrpc",
+    version,
+    about = "MessagePack-RPC calls and shared sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Operation,
