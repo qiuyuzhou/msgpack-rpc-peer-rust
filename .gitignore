@@ -8,7 +8,9 @@
 # Contributor-local tracker and editor state
 /.beads/
 /.codex/
-/.agents/skills/beads/
 
 # Rust build artifacts
 /target/
+
+# skills.sh lock
+/skills-lock.json
