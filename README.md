@@ -57,6 +57,8 @@ limits, error categories, and diagnostics.
 
 ## Guides
 
+- [mrpc test CLI and shared sessions](docs/mrpc.md)
+
 - [Transport integration](docs/transports.md)
 - [Architecture overview](docs/architecture.md)
 - [Development](docs/development.md)

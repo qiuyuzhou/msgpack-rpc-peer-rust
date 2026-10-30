@@ -86,11 +86,28 @@ impl OutgoingRequest {
             &(0u8, self.id, method, encoded),
             self.shared.config.max_outgoing_bytes,
         )?;
-        self.shared.commit(permit, frame, Some(self.id))?;
+        self.shared.commit(permit, frame, Some(self.id), None)?;
         let value = (&mut self.receiver)
             .await
             .map_err(|_| self.shared.terminal())??;
         typed::decode_result(value, self.shared.config.max_incoming_bytes)
+    }
+
+    pub(super) async fn send_value(mut self, method: &str, params: Value) -> Result<Value, Error> {
+        let permit = self
+            .shared
+            .outgoing
+            .reserve()
+            .await
+            .map_err(|_| self.shared.terminal())?;
+        let peer = super::RpcPeer {
+            shared: self.shared.clone(),
+        };
+        let frame = peer.value_frame(vec![0.into(), self.id.into(), method.into(), params])?;
+        self.shared.commit(permit, frame, Some(self.id), None)?;
+        (&mut self.receiver)
+            .await
+            .map_err(|_| self.shared.terminal())?
     }
 }
 
