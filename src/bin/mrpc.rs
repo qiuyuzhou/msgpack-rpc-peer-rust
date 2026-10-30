@@ -1,9 +1,10 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use msgpack_rpc_peer::{Config, Error, RemoteError, RpcPeer, Value};
-use std::{error::Error as StdError, time::Duration};
+use msgpack_rpc_peer::{Config, Error, RemoteError, RpcPeer, SplitIo, Value};
+use std::{error::Error as StdError, ffi::OsString, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    process::{Child, Command},
     task::JoinSet,
 };
 
@@ -36,12 +37,15 @@ enum Operation {
         options: Options,
         #[arg(long)]
         listen: String,
+        /// Program and arguments; stdin/stdout carry MessagePack-RPC.
+        #[arg(last = true, num_args = 1..)]
+        command: Vec<OsString>,
     },
 }
 #[derive(Args)]
 struct Options {
-    #[arg(long, env = "MRPC_TARGET")]
-    target: String,
+    #[arg(long, help = "Target address [env: MRPC_TARGET]")]
+    target: Option<String>,
     #[arg(long, env = "MRPC_TIMEOUT", default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
     #[arg(short, long, env = "MRPC_OUTPUT", value_enum, default_value = "pretty")]
@@ -117,6 +121,14 @@ impl Listener {
 }
 
 impl Options {
+    fn address(&self) -> Result<Address, Failure> {
+        let target = self
+            .target
+            .clone()
+            .or_else(|| std::env::var("MRPC_TARGET").ok())
+            .ok_or("--target or MRPC_TARGET is required")?;
+        Address::parse(&target)
+    }
     fn config(&self) -> Config {
         Config {
             default_call_timeout: Duration::from_secs(self.timeout),
@@ -178,8 +190,8 @@ async fn emit(
     Ok(())
 }
 async fn call(call: Call, notification: bool) -> Result<(), Failure> {
+    let target = call.options.address()?;
     let params = params(&call).await?;
-    let target = Address::parse(&call.options.target)?;
     let stream =
         tokio::time::timeout(Duration::from_secs(call.options.timeout), target.connect()).await??;
     let (peer, owner) = RpcPeer::builder()
@@ -215,9 +227,12 @@ fn forward_error(error: Error) -> RemoteError {
         error => RemoteError::new(Value::from(error.to_string())).unwrap(),
     }
 }
-async fn forward(options: Options, listen: String) -> Result<(), Failure> {
-    let listener = Listener::bind(Address::parse(&listen)?).await?;
-    let target = Address::parse(&options.target)?;
+async fn forward_session(
+    options: &Options,
+    listener: Listener,
+    stream: Socket,
+    child: &mut Option<Child>,
+) -> Result<(), Failure> {
     let format = options.output;
     let (events, mut receiver) = tokio::sync::mpsc::channel(Config::default().max_handlers);
     let builder = RpcPeer::builder()
@@ -230,9 +245,7 @@ async fn forward(options: Options, listen: String) -> Result<(), Failure> {
         Ok::<(), Failure>(())
     };
     tokio::pin!(output);
-    let (target, owner) = builder.start(
-        tokio::time::timeout(Duration::from_secs(options.timeout), target.connect()).await??,
-    )?;
+    let (target, owner) = builder.start(stream)?;
     let requests = target.clone();
     let (notifications, mut notification_rx) =
         tokio::sync::mpsc::channel::<(String, Value)>(Config::default().application_queue_capacity);
@@ -257,10 +270,20 @@ async fn forward(options: Options, listen: String) -> Result<(), Failure> {
         })
         .notification_sink(notifications);
     let mut connections = JoinSet::new();
-    let waiting = owner.wait();
-    tokio::pin!(waiting);
+    let mut waiting = Box::pin(owner.wait());
     loop {
         tokio::select! {
+            status = async {
+                match child.as_mut() {
+                    Some(child) => child.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                drop(waiting);
+                drop(builder);
+                tokio::time::timeout(Config::default().graceful_shutdown_timeout, &mut output).await??;
+                return Err(format!("subprocess exited: {}; shared session ended", status?).into());
+            }
             result = &mut output => { result?; return Err("notification output closed".into()); }
             result = &mut notifying => { result?; return Err("notification forwarding closed".into()); }
             result = &mut waiting => {
@@ -277,17 +300,116 @@ async fn forward(options: Options, listen: String) -> Result<(), Failure> {
         }
     }
 }
+fn stop_signal() -> Result<impl std::future::Future<Output = i32>, Failure> {
+    #[cfg(unix)]
+    {
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => 130,
+                _ = terminate.recv() => 143,
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+            130
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Interrupted(i32);
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "forward interrupted")
+    }
+}
+impl StdError for Interrupted {}
+
+async fn forward(options: Options, listen: String, command: Vec<OsString>) -> Result<(), Failure> {
+    if !command.is_empty() && options.target.is_some() {
+        return Err("--target conflicts with a subprocess command".into());
+    }
+    if command.is_empty()
+        && std::env::args_os().last().as_deref() == Some(std::ffi::OsStr::new("--"))
+    {
+        return Err("-- requires a subprocess program".into());
+    }
+    let address = if command.is_empty() {
+        Some(options.address()?)
+    } else {
+        None
+    };
+    let listener = Listener::bind(Address::parse(&listen)?).await?;
+    let signal = stop_signal()?;
+    tokio::pin!(signal);
+    let mut child = None;
+    let stream: Socket = if let Some(address) = address {
+        tokio::select! {
+            stream = tokio::time::timeout(Duration::from_secs(options.timeout), address.connect()) => stream??,
+            code = &mut signal => return Err(Box::new(Interrupted(code))),
+        }
+    } else {
+        let mut process = Command::new(&command[0])
+            .args(&command[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stream = SplitIo::new(
+            process.stdout.take().unwrap(),
+            process.stdin.take().unwrap(),
+        );
+        child = Some(process);
+        Box::new(stream)
+    };
+    let result = {
+        let session = forward_session(&options, listener, stream, &mut child);
+        tokio::pin!(session);
+        tokio::select! {
+            result = &mut session => result,
+            code = &mut signal => Err(Box::new(Interrupted(code)) as Failure),
+        }
+    };
+    if let Some(child) = child.as_mut() {
+        let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                child.kill().await?;
+                child.wait().await?
+            }
+        };
+        eprintln!("mrpc: subprocess exited: {status}");
+    }
+    result
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let result = match Cli::parse().command {
         Operation::Request(args) => call(args, false).await,
         Operation::Notify(args) => call(args, true).await,
-        Operation::Forward { options, listen } => forward(options, listen).await,
+        Operation::Forward {
+            options,
+            listen,
+            command,
+        } => forward(options, listen, command).await,
     };
     if let Err(error) = result {
         if !matches!(error.downcast_ref::<Error>(), Some(Error::Remote(_))) {
             eprintln!("mrpc: {error}");
         }
-        std::process::exit(1);
+        std::process::exit(
+            error
+                .downcast_ref::<Interrupted>()
+                .map_or(1, |signal| signal.0),
+        );
     }
 }

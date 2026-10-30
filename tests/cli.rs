@@ -709,3 +709,164 @@ async fn environment_options_are_validated_and_cli_options_override_them() {
         .unwrap();
     assert!(String::from_utf8_lossy(&output.stderr).contains("address must"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subprocess_command_overrides_environment_and_reports_clean_exit_as_session_end() {
+    let output = timeout(
+        Duration::from_secs(8),
+        cli()
+            .env("MRPC_TARGET", "invalid")
+            .args([
+                "forward",
+                "--listen",
+                "tcp://127.0.0.1:0",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo child-diagnostic >&2; exit 0",
+            ])
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("child-diagnostic"), "{stderr}");
+    assert!(stderr.contains("subprocess exited"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subprocess_arguments_reject_conflicts_empty_commands_and_spawn_failures() {
+    for (args, diagnostic) in [
+        (
+            vec![
+                "forward",
+                "--listen",
+                "tcp://127.0.0.1:0",
+                "--target",
+                "tcp://127.0.0.1:1",
+                "--",
+                "/bin/true",
+            ],
+            "conflicts",
+        ),
+        (
+            vec!["forward", "--listen", "tcp://127.0.0.1:0", "--"],
+            "program",
+        ),
+        (
+            vec![
+                "forward",
+                "--listen",
+                "tcp://127.0.0.1:0",
+                "--",
+                "/no/such/mrpc-program",
+            ],
+            "No such file",
+        ),
+    ] {
+        let output = cli()
+            .env("MRPC_TARGET", "invalid")
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(diagnostic), "{stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subprocess_signal_cleanup_closes_stdin_and_forces_unresponsive_children() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    timeout(Duration::from_secs(18), async {
+        for (signal, code, script) in [
+            (
+                "-INT",
+                130,
+                "echo ready >&2; cat >/dev/null; echo input-closed >&2",
+            ),
+            ("-TERM", 143, "echo ready >&2; exec sleep 60"),
+        ] {
+            let mut forward = cli()
+                .args([
+                    "forward",
+                    "--listen",
+                    "tcp://127.0.0.1:0",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    script,
+                ])
+                .spawn()
+                .unwrap();
+            let mut stderr = BufReader::new(forward.stderr.take().unwrap());
+            let mut text = String::new();
+            stderr.read_line(&mut text).await.unwrap();
+            assert_eq!(text, "ready\n");
+            assert!(
+                Command::new("kill")
+                    .args([signal, &forward.id().unwrap().to_string()])
+                    .status()
+                    .await
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(forward.wait().await.unwrap().code(), Some(code));
+            use tokio::io::AsyncReadExt;
+            stderr.read_to_string(&mut text).await.unwrap();
+            assert!(text.contains("subprocess exited"), "{text}");
+            if signal == "-INT" {
+                assert!(text.contains("input-closed"), "{text}");
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subprocess_stdout_eof_cleans_up_a_still_running_child() {
+    let output = timeout(
+        Duration::from_secs(8),
+        cli()
+            .args([
+                "forward",
+                "--listen",
+                "tcp://127.0.0.1:0",
+                "--",
+                "/bin/sh",
+                "-c",
+                "exec 1>&-; exec sleep 60",
+            ])
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("subprocess exited"));
+}
+
+#[tokio::test]
+async fn missing_target_is_rejected_before_reading_stdin() {
+    let mut child = cli()
+        .args(["request", "echo", "--params-file", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _open_stdin = child.stdin.take().unwrap();
+    let output = timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--target"));
+}

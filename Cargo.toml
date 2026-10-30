@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-cli = ["dep:clap", "dep:serde_json", "tokio/net", "tokio/io-std", "tokio/fs"]
+cli = ["dep:clap", "dep:serde_json", "tokio/net", "tokio/io-std", "tokio/fs", "tokio/process", "tokio/signal"]
 
 [[bin]]
 name = "mrpc"

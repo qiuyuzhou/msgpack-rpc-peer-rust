@@ -35,3 +35,6 @@ The target-side session associated with one persistent connection and shared by 
 
 **Session forwarder**:
 An intermediary RPC peer that forwards method invocations from callers through a shared RPC session and returns request outcomes to their originating callers.
+
+**Subprocess target**:
+An RPC peer started and owned by the session forwarder, whose shared RPC session lasts for that subprocess connection.
