@@ -27,7 +27,7 @@ printf '["hello"]' | mrpc request echo --params-file -
 mrpc request status --target tcp://localhost:1234 --output pretty --timeout 5
 ```
 
-`--target` overrides `MRPC_TARGET`. `--params` and `--params-file` conflict.
+`--target`, `--output` (`-o`), and `--timeout` override `MRPC_TARGET`, `MRPC_OUTPUT`, and `MRPC_TIMEOUT`, respectively. `--params` also has the short form `-p`. `--params` and `--params-file` conflict.
 Input must be exactly one JSON array; scalar, object, null, malformed JSON,
 and trailing non-whitespace content fail. Without an input option, the CLI
 uses `[]` and does not read stdin. File/stdin input is bounded to 1 MiB;
@@ -94,7 +94,7 @@ Forwarded target notifications use this structure:
 ```
 
 Local diagnostics use stderr and a nonzero exit status. `--output compact`
-(the default) emits one record per line. `--output pretty` preserves the same
+emits one record per line. `--output pretty` (the default) preserves the same
 structure with multiline formatting. Each process controls its own output;
 caller formatting options do not affect forwarder notifications.
 
