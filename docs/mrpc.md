@@ -66,9 +66,9 @@ Caller timeout or disconnect leaves the target session alive. Disconnect
 cancels that caller's pending handlers; late responses cannot match later
 requests. `forward --timeout` limits forwarded request waits independently of
 the calling command's timeout. When the target disconnects, the forwarder
-drains already-received notification output for at most five seconds, then
-exits with a nonzero status and closes its callers. It never reconnects or
-replays operations.
+stops accepting callers and closes their connections, then drains
+already-received notification output for at most five seconds before exiting
+with a nonzero status. It never reconnects or replays operations.
 
 Target notifications appear on the forwarder's stdout and are not sent to
 callers. Target requests receive the library's unknown-method error because
@@ -102,6 +102,11 @@ every exit path waits up to five seconds for the direct child to exit, then
 forcibly terminates and reaps it. This grace period is independent of
 `--timeout`; signals are not explicitly relayed, and descendant processes are
 not managed.
+
+After subprocess exit or stdout EOF, notification output drains concurrently
+with child cleanup, so blocked output does not delay child reaping. Signal
+exits do not drain additional notifications. Cleanup and output-drain failures
+are reported separately and do not replace the original exit cause or status.
 
 ## Output
 

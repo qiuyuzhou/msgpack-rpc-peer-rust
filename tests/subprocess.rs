@@ -165,6 +165,16 @@ async fn verify_forward() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    #[cfg(all(feature = "cli", unix))]
+    if std::env::args().nth(1).as_deref() == Some("--last-notification") {
+        let notification = msgpack_rpc_peer::Value::Array(vec![
+            2.into(),
+            "last-event".into(),
+            msgpack_rpc_peer::Value::Array(vec!["x".repeat(800_000).into()]),
+        ]);
+        rmpv::encode::write_value(&mut std::io::stdout(), &notification).unwrap();
+        return;
+    }
     #[cfg(feature = "cli")]
     if std::env::args().nth(1).as_deref() == Some("--forward-peer") {
         forward_peer().await;
@@ -181,5 +191,44 @@ async fn main() {
         timeout(Duration::from_secs(10), verify_forward())
             .await
             .unwrap();
+        #[cfg(all(feature = "cli", unix))]
+        timeout(Duration::from_secs(10), verify_blocked_output_cleanup())
+            .await
+            .unwrap();
     }
+}
+
+#[cfg(all(feature = "cli", unix))]
+async fn verify_blocked_output_cleanup() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut forward = Command::new(env!("CARGO_BIN_EXE_mrpc"))
+        .args([
+            "forward",
+            "--listen",
+            "tcp://127.0.0.1:0",
+            "--",
+            "/bin/sh",
+            "-c",
+            "\"$1\" --last-notification; exec 1>&-; echo ready >&2; cat >/dev/null",
+            "sh",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .env_remove("MRPC_TARGET")
+        .env_remove("MRPC_TIMEOUT")
+        .env_remove("MRPC_OUTPUT")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(forward.stderr.take().unwrap()).lines();
+    assert_eq!(stderr.next_line().await.unwrap().as_deref(), Some("ready"));
+    // Leave stdout unread: draining a large notification must not delay reaping.
+    let reaped = timeout(Duration::from_secs(2), stderr.next_line())
+        .await
+        .expect("child cleanup waited for blocked notification output")
+        .unwrap()
+        .unwrap();
+    assert!(reaped.contains("subprocess exited"), "{reaped}");
+    assert_eq!(forward.wait().await.unwrap().code(), Some(1));
 }

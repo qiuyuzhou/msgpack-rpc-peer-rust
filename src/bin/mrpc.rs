@@ -11,6 +11,8 @@ mod call;
 mod forward;
 #[path = "mrpc/output.rs"]
 mod output;
+#[path = "mrpc/target.rs"]
+mod target;
 #[path = "mrpc/transport.rs"]
 mod transport;
 
